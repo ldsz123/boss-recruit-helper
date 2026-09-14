@@ -68,7 +68,9 @@ https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell
 ### 在线激活网页
 
 - 本地双击打开：`activate.html`
-- 部署到静态托管后给买家访问（Gitee Pages / jsDelivr / Vercel 均可）
+- 部署后给买家访问：Gitee 仓库 → **服务 → Gitee Pages** → 部署目录选根目录 → 得到
+  `https://zzc356.gitee.io/boss-recruit-helper/activate.html`（脚本里「获取激活码」按钮已指向它）
+  部署到别处（Vercel / 自有域名）时，改 `sell-kit/license-ui.js` 的 `LICENSE_PAGE` 后重跑 `make-sell.js`
 
 网页功能：① 用户粘贴激活码验证有效性；② 作者输入口令批量发码（永久 / 30 / 90 / 180 / 365 天），可复制或导出 CSV；③ 购买方式展示（在 `activate.html` 顶部 `CONFIG.buy` 里配置微信 / QQ / 闲鱼等）。
 

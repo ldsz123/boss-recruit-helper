@@ -1669,8 +1669,10 @@
    * 想调整哪些功能收费，改这 6 个函数开头的 requirePro(...) 一行即可。
    * ============================================================================== */
 
-  /** 在线激活网页地址（脚本内「获取激活码」按钮会打开它） */
-  const LICENSE_PAGE = 'https://cdn.jsdelivr.net/gh/zzc356/boss-recruit-helper@master/activate.html';
+  /** 在线激活网页地址（脚本内「获取激活码」按钮会打开它）
+   *  默认用 Gitee Pages：需在 Gitee 仓库 → 服务 → Gitee Pages 部署一次（目录选根目录）。
+   *  换其他托管（Vercel / 自有域名）时改这里，然后重跑 make-sell.js。 */
+  const LICENSE_PAGE = 'https://zzc356.gitee.io/boss-recruit-helper/activate.html';
   /** 可选：远程授权接口。留空 = 纯离线校验；填了则激活时多一道服务端校验（返回 {ok:true/false,msg}） */
   const LICENSE_API = '';
 
