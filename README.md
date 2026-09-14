@@ -47,6 +47,35 @@ Edge 138+ 之后，**光开「开发人员模式」不够**，还要单独给篡
 
 ---
 
+## 💎 版本区别
+
+| | 免费版 | 授权版（付费） |
+|---|---|---|
+| 安装文件 | `boss-recruit-helper.user.js` | `boss-recruit-helper-sell.user.js` |
+| 抓取 JD / 上传简历 / 本地关键词匹配 | ✅ | ✅ |
+| AI 简历优化、AI 话术生成 | ✅ | ✅（需激活码） |
+| 岗位扫描匹配、简历图片发送、PDF/图片导出 | ✅ | ✅（需激活码） |
+| 激活要求 | 无需 | 需激活码（在线激活页：见下） |
+
+### 授权版安装
+
+```
+https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js
+```
+
+未激活时，付费功能会弹出激活框；填入激活码即解锁。激活入口：面板 → **⚙️ 设置** → 激活码 → **🔑 激活**。
+
+### 在线激活网页
+
+- 本地双击打开：`activate.html`
+- 部署到静态托管后给买家访问（Gitee Pages / jsDelivr / Vercel 均可）
+
+网页功能：① 用户粘贴激活码验证有效性；② 作者输入口令批量发码（永久 / 30 / 90 / 180 / 365 天），可复制或导出 CSV；③ 购买方式展示（在 `activate.html` 顶部 `CONFIG.buy` 里配置微信 / QQ / 闲鱼等）。
+
+> ⚠️ 静态方案说明：激活码算法与口令都在前端可见，理论上可被逆向自签发。低价走量够用；若需要**一机一码 / 随时吊销 / 防泄漏**，请部署 `sell-kit/license-server-example.js`，并把脚本里 `LICENSE_API` 指向你的 `/verify` 接口后重跑 `make-sell.js`。
+
+---
+
 ## ⚙️ 配置 AI
 
 面板 → **⚙️ 设置** → 填「接口地址」+「API Key」+「模型名称」→ 保存 → 点「测试连通」。
@@ -84,9 +113,17 @@ Edge 138+ 之后，**光开「开发人员模式」不够**，还要单独给篡
 
 **发版流程**（本仓库默认分支为 `master`）：
 
-1. 改脚本里的 `@version` 与 `VERSION`（如 `1.3.1`）
-2. 双击 `update-and-push.bat`，输入提交说明，自动 commit + push
-3. 用户端：篡改猴会自动检查并提示更新；也可在面板「⚙️ 设置」点「🔄 检查更新」
+1. 改免费版脚本里的 `@version` 与 `VERSION`（如 `1.3.1`）
+2. **重新生成授权版**（两个版本号必须同步）：
+   ```bash
+   cd sell-kit
+   node make-sell.js      # 由免费版生成 ../boss-recruit-helper-sell.user.js
+   node test-license.js   # 跑一遍授权自检，确认拦截与激活正常
+   node build-activate.js # 若改过算法/模板，重新生成 activate.html
+   ```
+   > `make-sell.js` 会校验每一处注入点，若免费版改动导致匹配不上会明确报错（不会静默产出坏版本）。
+3. 双击 `update-and-push.bat`，输入提交说明，自动 commit + push
+4. 用户端：篡改猴会自动检查并提示更新；也可在面板「⚙️ 设置」点「🔄 检查更新」
 
 > 若 Gitee raw 被限流导致更新失败，用户可在「⚙️ 设置 → 云端更新地址」填其他镜像地址覆盖默认地址。
 

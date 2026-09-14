@@ -19,3 +19,8 @@ node_modules/
 *.zip
 *.pdf
 *.png
+
+# 激活码与授权数据（绝不能进公开仓库）
+my-codes.txt
+codes.json
+*.codes.txt
