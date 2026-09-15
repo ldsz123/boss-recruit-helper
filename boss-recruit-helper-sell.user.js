@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.3.0
-// @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并下载/投递
+// @version      1.6.0
+// @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
 // @match        https://zhipin.com/*
@@ -10,6 +10,7 @@
 // @require      https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
+// 注：导出优先用预载的 html2canvas + jsPDF 生成真实 PDF/图片文件；CDN 不可用时自动降级为 SVG 渲染 + 浏览器打印
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
@@ -37,11 +38,13 @@
     resume: 'brh_resume',    // 用户原始简历文本
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
+    hrQuestion: 'brh_hr_question', // 最近一次 HR 提问（智能回复用）
+    hrReply: 'brh_hr_reply',    // 最近一次生成的 HR 回复
     greetingTpl: 'brh_greeting_tpl',        // 当前选中的话术模板 id
     greetingTemplates: 'brh_greeting_templates', // 自定义话术模板数组（覆盖默认）
     matchRes: 'brh_match_res',  // 最近一次岗位匹配结果（数组）
     license: 'brh_license',     // 授权码（可选，售卖时启用）
-    resumeTheme: 'brh_resume_theme', // 简历版式：modern（现代简约）/ business（深色商务）
+    resumeTheme: 'brh_resume_theme', // 简历版式：modern / business / elegant
     updateUrl: 'brh_update_url'      // 用户自定义的云端更新地址（覆盖默认）
   };
 
@@ -49,12 +52,12 @@
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: '',
     model: 'deepseek-chat',
-    resumeTheme: 'modern',  // modern | business
+    resumeTheme: 'modern',  // modern | business | elegant
     updateUrl: ''           // 留空则使用脚本内置的默认托管地址
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.3.0';
+  const VERSION = '1.6.0';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -343,7 +346,7 @@
   }
 
   function runMatch(mode) {
-    if (!isPro()) { showLicenseModal('match', () => runMatch(mode)); return; }
+    if (!isPro('match')) { showLicenseModal('match', () => runMatch(mode)); return; }
     const resume = getStore(STORE_KEYS.resume, '');
     if (!resume) { toast('请先上传简历', 'err'); UI.switchTab('resume'); return; }
     const jobs = extractJobCards();
@@ -538,7 +541,7 @@
   }
 
   function optimizeResume() {
-    if (!isPro()) { showLicenseModal('optimize', () => optimizeResume()); return; }
+    if (!isPro('optimize')) { showLicenseModal('optimize', () => optimizeResume()); return; }
     const jd = getStore(STORE_KEYS.jd, '');
     const resume = getStore(STORE_KEYS.resume, '');
     if (!jd || jd.length < 30) { toast('请先在「JD」页抓取或粘贴岗位信息', 'err'); UI.switchTab('jd'); return; }
@@ -598,7 +601,7 @@
   }
 
   function generateGreeting(opts) {
-    if (!isPro()) { showLicenseModal('greeting', () => generateGreeting(opts)); return; }
+    if (!isPro('greeting')) { showLicenseModal('greeting', () => generateGreeting(opts)); return; }
     opts = opts || {};
     const jd = getStore(STORE_KEYS.jd, '');
     const resume = getStore(STORE_KEYS.resume, '');
@@ -624,6 +627,74 @@
       const ga = $('#brh-opt-greet');
       if (ga) ga.value = content;
     }, opts.silent ? 'brh-optimize' : 'brh-chat');
+  }
+
+  /* ---- HR 智能回复：抓取 HR 最新提问 → 结合优化简历与 JD 生成针对性回复 ---- */
+
+  // 从聊天窗口抓取 HR 的最新消息（Boss 消息 DOM 无稳定 class，做多选择器 + 关键词兜底）
+  function extractHrQuestion() {
+    const candidates = [
+      '.im-list .im-item .im-msg-left',
+      '.im-item .msg-left',
+      '.chat-message .msg-left',
+      '.message-list .left',
+      '[class*="msg-left"]',
+      '[class*="im-msg-left"]'
+    ];
+    let best = '';
+    for (const sel of candidates) {
+      $$(sel).forEach((el) => {
+        const t = txt(el);
+        // 只要像「提问」的气泡：含问号/疑问词，或明显长于寒暄
+        if (t && t.length > 4 && t.length < 500 && /[?？]|请教|了解|方便|期望|考虑|为什么|多久|薪资|经验|介绍|到岗|住址|离职|加班/.test(t)) {
+          if (t.length >= best.length) best = t;
+        }
+      });
+      if (best) break;
+    }
+    return best;
+  }
+
+  function generateHrReply(opts = {}) {
+    if (!isPro('greeting')) { showLicenseModal('greeting', () => generateHrReply(opts)); return; }
+    const optimized = getStore(STORE_KEYS.optimized, '');
+    if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
+    const jd = getStore(STORE_KEYS.jd, '');
+    const manual = opts.manual || '';
+    let question = manual || extractHrQuestion();
+    if (!question) {
+      // 页面上抓不到 → 让用户手动粘贴 HR 的问题
+      const v = prompt('未在当前页面识别到 HR 的新提问。\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
+      if (!v || !v.trim()) return;
+      question = v.trim();
+    }
+    setStore(STORE_KEYS.hrQuestion, question);
+    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在结合优化后的简历生成针对性回复…');
+
+    const sys = [
+      '你是一位帮助求职者与 HR 沟通的顾问。根据 HR 的最新提问，用候选人的第一人称写一条 Boss 直聘回复。',
+      '严格遵守：',
+      '1. 只使用【优化后简历】里真实存在的经历与数据，严禁编造；',
+      '2. 只回答 HR 问到的点（可顺带 1 句优势补充），不要泛泛自我介绍；',
+      '3. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '4. 如果 HR 的问题涉及简历未覆盖的信息（如到岗时间、期望薪资），给出得体的通用答法并提醒用户按实际情况确认；',
+      '5. 只输出回复正文，不要引号、前缀和解释。'
+    ].join('\n');
+    const messages = [
+      { role: 'system', content: sys },
+      { role: 'user', content: [
+        jd ? `【目标岗位 JD】\n${jd.slice(0, 2000)}` : '',
+        `【优化后简历】\n${optimized.slice(0, 6000)}`,
+        `【HR 的最新提问】\n${question}`
+      ].filter(Boolean).join('\n\n') }
+    ];
+
+    callLLM(messages, (content) => {
+      setStore(STORE_KEYS.hrReply, content);
+      UI.renderHrReply(content, question);
+      UI.showStatus('brh-chat', '✅ 回复已生成，检查后可填入聊天框', 'ok');
+      if (!opts.silent) toast('针对 HR 提问的回复已生成', 'ok');
+    }, 'brh-chat');
   }
 
   /* ============================================================
@@ -679,6 +750,7 @@
   }
 
   function downloadOptimized(fmt) {
+    if (!isPro('export')) { showLicenseModal('export', () => downloadOptimized(fmt)); return; }
     const content = getStore(STORE_KEYS.optimized, '');
     if (!content) { toast('还没有优化结果，请先点击「开始优化」', 'err'); return; }
     const meta = getStore(STORE_KEYS.jdMeta, {});
@@ -695,8 +767,12 @@
    * ========================================================== */
 
   const RESUME_THEMES = {
-    modern: { name: '现代简约', accent: '#00a1ea' },
-    business: { name: '深色商务', accent: '#1e3a5f' }
+    modern:   { name: '现代简约', accent: '#0ea5e9', soft: '#e8f6fe', layout: 'modern' },
+    business: { name: '深色商务', accent: '#1e3a5f', soft: '#eef2f7', layout: 'business' },
+    elegant:  { name: '雅致衬线', accent: '#8a5a3b', soft: '#f7f0ea', layout: 'elegant' },
+    ocean:    { name: '深海渐变', accent: '#2563eb', soft: '#dbeafe', layout: 'ocean' },
+    vitality: { name: '活力橙红', accent: '#ea580c', soft: '#ffedd5', layout: 'vitality' },
+    jade:     { name: '青玉留白', accent: '#0f766e', soft: '#ccfbf1', layout: 'jade' }
   };
 
   function getResumeTheme() {
@@ -741,104 +817,349 @@
     return data;
   }
 
-  // 生成好看的简历 HTML（A4 宽度 794px ≈ 210mm @96dpi）
-  function buildResumeHTML(md, theme) {
+  // 从正文里提取联系方式，避免在页眉和正文中重复展示
+  function extractContacts(md) {
+    const text = String(md || '');
+    return {
+      phone: (text.match(/1[3-9]\d{9}/) || [])[0] || '',
+      email: (text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/) || [])[0] || ''
+    };
+  }
+
+  // 技能/证书类分区用标签云展示，更像真实简历
+  const CHIP_TITLE_RE = /(技能|专长|能力|证书|标签|工具|语言|Skills?)/i;
+
+  // 生成简历 HTML（A4 宽度 794px ≈ 210mm @96dpi；打印时用 CSS 换算成 mm）
+  // opts.watermark：溯源水印文本（售卖版激活后自动带授权标识，防止截图/转卖后无法追责）
+  function buildResumeHTML(md, theme, opts) {
     const d = parseResumeMarkdown(md);
     const meta = getStore(STORE_KEYS.jdMeta, {});
-    const accent = RESUME_THEMES[theme] ? RESUME_THEMES[theme].accent : '#00a1ea';
-    const name = d.name || '个人简历';
-    const head = d.headline ||
-      (meta.title ? `求职意向：${meta.title}${meta.salary ? '　·　' + meta.salary : ''}` : '');
+    const th = RESUME_THEMES[theme] ? RESUME_THEMES[theme] : RESUME_THEMES.modern;
+    const accent = th.accent;
+    const soft = th.soft || '#eef6fc';
+    const wm = (opts && opts.watermark) ? String(opts.watermark) : '';
+    const ct = extractContacts(md);
     const today = nowStr().slice(0, 10);
 
+    // 姓名行常写成「张三 — 应聘岗位」，拆开更美观
+    let name = d.name || '个人简历';
+    let head = d.headline || '';
+    const nmSplit = name.match(/^(.{2,8}?)\s*[—–\-|｜·]\s*(.+)$/);
+    if (nmSplit) { name = nmSplit[1].trim(); if (!head) head = nmSplit[2].trim(); }
+
+    // 页眉已单独展示联系方式，正文里同款信息去掉，避免重复
+    const cleanBit = (s) => {
+      let t = String(s || '')
+        .split(ct.phone).join('').split(ct.email).join('')
+        .replace(/\*\*|__|`/g, '')
+        .replace(/电\s*话\s*[:：]?/g, '').replace(/邮\s*箱\s*[:：]?/g, '');
+      t = t.replace(/[\s|｜·、,，/]*[|｜][\s|｜·、,，/]*/g, ' | ');   // 分隔符规整
+      return t.replace(/\s{2,}/g, ' ')
+        .replace(/^[\s|｜·、,，/]+|[\s|｜·、,，/]+$/g, '')
+        .trim();
+    };
+    head = cleanBit(head);
+    if (!head) head = meta.title ? `求职意向：${meta.title}${meta.salary ? '　·　' + meta.salary : ''}` : '';
+
+    const contactBits = [ct.phone, ct.email].filter(Boolean);
+    const contactHtml = contactBits.length
+      ? `<div class="rs-contact">${contactBits.map((b) => `<span>${inlineMd(b)}</span>`).join('')}</div>`
+      : '';
+
+    // 正文里若已出现联系方式，就不再重复渲染该行
+    const dropContact = (t) => {
+      if (!t) return false;
+      if (ct.phone && t.indexOf(ct.phone) >= 0) return true;
+      if (ct.email && t.indexOf(ct.email) >= 0) return true;
+      return false;
+    };
+
     const sectionsHtml = d.sections.map((s) => {
+      const isChip = CHIP_TITLE_RE.test(s.title || '');
       let inner = '';
-      (s.paras || []).forEach((p) => { inner += `<div class="rs-p">${inlineMd(p)}</div>`; });
-      (s.items || []).forEach((it) => {
-        inner += it.sub
-          ? `<div class="rs-sub">${inlineMd(it.sub)}</div>`
-          : `<div class="rs-li"><span class="rs-dot"></span><div>${inlineMd(it.text)}</div></div>`;
+      (s.paras || []).forEach((p) => {
+        if (dropContact(p)) return;
+        inner += `<div class="rs-p">${inlineMd(p)}</div>`;
       });
-      const titleHtml = s.title ? `<div class="rs-sec-t">${inlineMd(s.title)}</div>` : '';
-      return `<div class="rs-sec">${titleHtml}${inner}</div>`;
+      (s.items || []).forEach((it) => {
+        if (dropContact(it.text || it.sub || '')) return;
+        if (it.sub) { inner += `<div class="rs-sub">${inlineMd(it.sub)}</div>`; return; }
+        if (isChip) { inner += `<span class="rs-chip">${inlineMd(it.text)}</span>`; return; }
+        inner += `<div class="rs-li"><i class="rs-dot"></i><div>${inlineMd(it.text)}</div></div>`;
+      });
+      if (!inner) return '';
+      const titleHtml = s.title
+        ? `<div class="rs-sec-t"><span class="rs-bar"></span><span class="rs-sec-txt">${inlineMd(s.title)}</span><span class="rs-sec-line"></span></div>`
+        : '';
+      return `<div class="rs-sec">${titleHtml}${isChip ? `<div class="rs-chips">${inner}</div>` : inner}</div>`;
     }).join('');
 
-    const foot = `<div class="rs-foot">由 Boss招聘小助手 生成 · ${today}${meta.company ? ' · 投递：' + inlineMd(meta.company) : ''}</div>`;
+    const wmTag = wm ? `<span class="rs-foot-lic">${esc(wm)}</span>` : '';
+    const foot = `<div class="rs-foot"><span>Boss招聘小助手 · 定制优化</span><span>${today}${meta.company ? ' · 投递 ' + inlineMd(meta.company) : ''}</span>${wmTag}</div>`;
+    const wmHtml = wm
+      ? `<div class="rs-wm" aria-hidden="true"><span>${esc(wm)}</span><span>${esc(wm)}</span><span>${esc(wm)}</span></div>`
+      : '';
 
     const style = `
-      .rs-wrap{ width:794px; background:#fff; font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB',sans-serif; color:#222; box-sizing:border-box; }
+      .rs-wrap{ width:794px; background:#fff; color:#262626; box-sizing:border-box; position:relative; overflow:hidden;
+                font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Source Han Sans SC',sans-serif; }
       .rs-wrap *{ box-sizing:border-box; }
-      .rs-sec{ margin-bottom:14px; }
-      .rs-sec-t{ font-size:15px; font-weight:700; color:${accent}; padding:4px 0 5px 10px; border-left:4px solid ${accent}; margin-bottom:8px; letter-spacing:.5px; }
-      .rs-sub{ font-size:13px; font-weight:700; color:#333; margin:9px 0 4px; }
-      .rs-p{ font-size:12.5px; line-height:1.75; margin:3px 0; color:#333; }
-      .rs-li{ display:flex; align-items:flex-start; font-size:12.5px; line-height:1.75; margin:3px 0; color:#333; }
-      .rs-dot{ flex:0 0 auto; width:5px; height:5px; background:${accent}; border-radius:50%; margin:9px 8px 0 2px; }
+      .rs-wm{ position:absolute; left:0; top:0; right:0; bottom:0; z-index:9; pointer-events:none;
+              display:flex; flex-direction:column; justify-content:space-evenly; align-items:center;
+              transform:rotate(-24deg); }
+      .rs-wm span{ font-size:24px; font-weight:700; color:rgba(100,116,139,.06); letter-spacing:4px; white-space:nowrap; }
+      .rs-foot-lic{ color:#b91c1c; opacity:.72; }
+      .rs-sec{ margin-bottom:15px; }
+      .rs-sec-t{ display:flex; align-items:center; margin-bottom:9px; }
+      .rs-bar{ width:4px; height:15px; background:${accent}; border-radius:2px; margin-right:8px; }
+      .rs-sec-txt{ font-size:15px; font-weight:700; color:${accent}; letter-spacing:1px; white-space:nowrap; }
+      .rs-sec-line{ flex:1; height:1px; margin-left:10px;
+                    background:linear-gradient(to right,${accent},rgba(255,255,255,0)); opacity:.5; }
+      .rs-sub{ font-size:13px; font-weight:700; color:#1f2937; margin:11px 0 5px; padding-left:9px;
+               border-left:3px solid ${accent}; }
+      .rs-p{ font-size:12.5px; line-height:1.85; margin:3px 0; color:#374151; }
+      .rs-li{ display:flex; align-items:flex-start; font-size:12.5px; line-height:1.85; margin:4px 0; color:#374151; }
+      .rs-dot{ flex:0 0 auto; width:5px; height:5px; background:${accent}; border-radius:1px;
+               margin:9px 9px 0 3px; transform:rotate(45deg); }
       .rs-li>div{ flex:1; }
-      .rs-foot{ font-size:10.5px; color:#aaa; text-align:center; margin-top:16px; padding-top:8px; border-top:1px dashed #e3e3e3; }
-      .rs-modern{ padding:34px 46px 26px; }
-      .rs-modern .rs-top{ border-bottom:3px solid ${accent}; padding-bottom:12px; margin-bottom:16px; }
-      .rs-modern .rs-name{ font-size:29px; font-weight:700; color:#1a1a1a; letter-spacing:2px; }
-      .rs-modern .rs-head{ font-size:13px; color:#666; margin-top:7px; }
+      .rs-chips{ display:flex; flex-wrap:wrap; gap:7px; }
+      .rs-chip{ display:inline-block; font-size:12px; line-height:1.6; padding:3px 11px; border-radius:11px;
+                background:${soft}; color:#1f2937; border:1px solid ${accent}33; }
+      .rs-foot{ display:flex; justify-content:space-between; font-size:10.5px; color:#9ca3af;
+                margin-top:18px; padding-top:9px; border-top:1px dashed #e5e7eb; }
+      .rs-contact{ display:flex; gap:16px; font-size:12px; color:#4b5563; }
+      .rs-contact span{ display:inline-flex; align-items:center; }
+      .rs-contact span::before{ content:''; width:4px; height:4px; border-radius:50%;
+                                background:${accent}; margin-right:6px; }
+
+      /* ---------- 版式一：现代简约 ---------- */
+      .rs-modern{ padding:40px 48px 30px; }
+      .rs-modern .rs-top{ display:flex; align-items:flex-end; justify-content:space-between;
+                          padding-bottom:16px; margin-bottom:20px; border-bottom:3px solid ${accent}; }
+      .rs-modern .rs-name{ font-size:31px; font-weight:700; color:#111827; letter-spacing:4px; line-height:1.2; }
+      .rs-modern .rs-head{ font-size:13.5px; color:${accent}; margin-top:9px; font-weight:600; letter-spacing:.5px; }
+
+      /* ---------- 版式二：深色商务（左右分栏） ---------- */
       .rs-business{ display:flex; min-height:1123px; }
-      .rs-business .rs-side{ width:236px; flex:0 0 236px; background:${accent}; color:#fff; padding:34px 26px; }
-      .rs-business .rs-side .rs-name{ font-size:26px; font-weight:700; letter-spacing:2px; line-height:1.3; }
-      .rs-business .rs-side .rs-line{ width:38px; height:3px; background:#fff; opacity:.85; margin:14px 0; }
-      .rs-business .rs-side .rs-head{ font-size:12.5px; line-height:1.8; opacity:.92; }
-      .rs-business .rs-side .rs-tag{ margin-top:18px; font-size:11px; opacity:.75; line-height:1.7; }
-      .rs-business .rs-main{ flex:1; padding:34px 38px 26px; background:#fff; }
+      .rs-business .rs-side{ width:240px; flex:0 0 240px; background:${accent}; color:#fff; padding:40px 26px; }
+      .rs-business .rs-side .rs-name{ font-size:27px; font-weight:700; letter-spacing:3px; line-height:1.35; }
+      .rs-business .rs-side .rs-line{ width:40px; height:3px; background:#fff; opacity:.9; margin:16px 0 14px; }
+      .rs-business .rs-side .rs-head{ font-size:12.5px; line-height:1.9; opacity:.95; }
+      .rs-business .rs-side .rs-contact{ margin-top:14px; color:#fff; opacity:.9; font-size:11.5px; flex-direction:column; gap:5px; }
+      .rs-business .rs-side .rs-contact span::before{ background:#fff; }
+      .rs-business .rs-side .rs-tag{ margin-top:24px; font-size:11px; opacity:.72; line-height:1.8;
+                                     border-top:1px solid rgba(255,255,255,.28); padding-top:12px; }
+      .rs-business .rs-main{ flex:1; padding:40px 40px 30px; background:#fff; }
+      .rs-business .rs-sec-txt{ color:${accent}; }
+
+      /* ---------- 版式三：雅致衬线 ---------- */
+      .rs-elegant{ padding:44px 52px 30px; font-family:Georgia,'Songti SC','SimSun','Microsoft YaHei',serif; }
+      .rs-elegant .rs-top{ text-align:center; padding-bottom:18px; margin-bottom:22px;
+                           border-bottom:1px solid ${accent}; position:relative; }
+      .rs-elegant .rs-top::after{ content:''; position:absolute; left:50%; bottom:-4px; width:56px; height:7px;
+                                  margin-left:-28px; background:#fff; border-left:1px solid ${accent};
+                                  border-right:1px solid ${accent}; }
+      .rs-elegant .rs-name{ font-size:30px; font-weight:700; color:${accent}; letter-spacing:6px; }
+      .rs-elegant .rs-head{ font-size:13px; color:#6b7280; margin-top:10px; letter-spacing:1px; }
+      .rs-elegant .rs-contact{ justify-content:center; margin-top:8px; }
+      .rs-elegant .rs-sec-txt{ color:${accent}; font-weight:600; }
+      .rs-elegant .rs-bar{ background:${accent}; }
+
+      /* ---------- 版式四：深海渐变（渐变横幅头部） ---------- */
+      .rs-ocean{ padding:0 48px 30px; }
+      .rs-ocean .rs-top{ margin:0 -48px 24px; padding:34px 48px 26px; color:#fff;
+                         background:linear-gradient(120deg,${accent} 0%,${accent}dd 55%,#7c3aed 130%);
+                         display:flex; align-items:flex-end; justify-content:space-between; }
+      .rs-ocean .rs-name{ font-size:31px; font-weight:700; letter-spacing:5px; color:#fff; }
+      .rs-ocean .rs-head{ font-size:13px; margin-top:9px; color:#fff; opacity:.92; letter-spacing:.5px; }
+      .rs-ocean .rs-contact{ color:rgba(255,255,255,.92); font-size:11.5px; gap:14px; }
+      .rs-ocean .rs-contact span::before{ background:#fff; }
+      .rs-ocean .rs-sec-t{ border:0; }
+      .rs-ocean .rs-sec-txt{ color:${accent}; }
+      .rs-ocean .rs-sec-line{ background:linear-gradient(to right,${accent},rgba(255,255,255,0)); }
+      .rs-ocean .rs-sec:first-of-type{ margin-top:-6px; }
+
+      /* ---------- 版式五：活力橙红（时间线） ---------- */
+      .rs-vitality{ padding:40px 48px 30px; }
+      .rs-vitality .rs-top{ display:flex; align-items:flex-end; gap:14px; margin-bottom:22px; }
+      .rs-vitality .rs-name{ font-size:30px; font-weight:800; color:#1c1917; letter-spacing:3px; }
+      .rs-vitality .rs-top .rs-head{ font-size:13px; color:#fff; background:${accent}; padding:4px 12px;
+                                     border-radius:14px; margin-bottom:6px; font-weight:600; }
+      .rs-vitality .rs-contact{ margin-bottom:18px; }
+      .rs-vitality .rs-sec{ position:relative; padding-left:20px; }
+      .rs-vitality .rs-sec::before{ content:''; position:absolute; left:5px; top:5px; bottom:2px; width:2px;
+                                    background:linear-gradient(${accent},${accent}22); border-radius:1px; }
+      .rs-vitality .rs-sec::after{ content:''; position:absolute; left:0; top:2px; width:12px; height:12px;
+                                   border-radius:50%; background:${accent}; border:3px solid ${soft}; }
+      .rs-vitality .rs-sec-t{ margin-bottom:8px; }
+      .rs-vitality .rs-bar{ display:none; }
+      .rs-vitality .rs-sec-txt{ color:${accent}; }
+      .rs-vitality .rs-sec-line{ display:none; }
+      .rs-vitality .rs-chip{ background:${accent}; color:#fff; border:0; border-radius:6px; font-weight:600; }
+
+      /* ---------- 版式六：青玉留白（极简双线） ---------- */
+      .rs-jade{ padding:46px 56px 30px; }
+      .rs-jade .rs-top{ text-align:center; padding-bottom:16px; margin-bottom:6px; }
+      .rs-jade .rs-name{ font-size:29px; font-weight:600; color:#134e4a; letter-spacing:10px; text-indent:10px; }
+      .rs-jade .rs-head{ font-size:12.5px; color:#6b7280; margin-top:9px; letter-spacing:2px; }
+      .rs-jade .rs-contact{ justify-content:center; margin-top:10px; }
+      .rs-jade .rs-topline{ height:3px; margin:14px 0 20px; border-top:2px solid #134e4a; border-bottom:1px solid #134e4a; }
+      .rs-jade .rs-sec-t{ margin-bottom:10px; }
+      .rs-jade .rs-bar{ width:9px; height:9px; background:${accent}; border-radius:2px; transform:rotate(45deg); margin-right:9px; }
+      .rs-jade .rs-sec-txt{ color:#134e4a; letter-spacing:3px; }
+      .rs-jade .rs-sec-line{ background:linear-gradient(to right,#99f6e4,rgba(255,255,255,0)); }
+      .rs-jade .rs-sub{ border-left-color:${accent}; }
     `;
 
+    const headBlock = head
+      ? `<div class="rs-head">${inlineMd(head)}</div>`
+      : '';
+    /* 水印层插在 .rs-wrap 内部（absolute 定位以简历纸面为参照） */
+    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}">${wmHtml}${inner}</div>`;
     const body = theme === 'business'
-      ? `<div class="rs-wrap rs-business">
+      ? withWm('rs-business', `
            <div class="rs-side">
              <div class="rs-name">${inlineMd(name)}</div>
              <div class="rs-line"></div>
              <div class="rs-head">${inlineMd(head)}</div>
-             <div class="rs-tag">Boss招聘小助手<br>定制优化简历</div>
+             ${contactHtml}
+             <div class="rs-tag">Boss招聘小助手<br/>按岗位 JD 定制优化</div>
            </div>
            <div class="rs-main">${sectionsHtml}${foot}</div>
-         </div>`
-      : `<div class="rs-wrap rs-modern">
+         `)
+      : theme === 'elegant'
+      ? withWm('rs-elegant', `
            <div class="rs-top">
              <div class="rs-name">${inlineMd(name)}</div>
-             ${head ? `<div class="rs-head">${inlineMd(head)}</div>` : ''}
+             ${headBlock}
+             ${contactHtml}
            </div>
            ${sectionsHtml}${foot}
-         </div>`;
+         `)
+      : theme === 'ocean'
+      ? withWm('rs-ocean', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'vitality'
+      ? withWm('rs-vitality', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+           </div>
+           ${contactHtml}
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'jade'
+      ? withWm('rs-jade', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+             ${contactHtml}
+           </div>
+           <div class="rs-topline"></div>
+           ${sectionsHtml}${foot}
+         `)
+      : withWm('rs-modern', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `);
 
     return `<style>${style}</style>${body}`;
   }
 
-  // 用 html2canvas 把模板渲染成画布（离屏，渲染完立即移除）
+  /* ------------------------------------------------------------------
+   * 渲染方案说明（重要）：
+   *   图片/PDF 优先用 Tampermonkey @require 预载的 html2canvas + jsPDF，
+   *   直接生成真实可下载的 .png / .pdf 文件（不依赖 SVG foreignObject，
+   *   不受目标站 CSP 对 data: 图片的限制——这正是旧版「图片无法生成」的原因）。
+   *   CDN 组件加载失败（断网等）时自动降级：
+   *     图片 → SVG foreignObject 原生渲染（零依赖）
+   *     PDF  → 打开打印窗口（矢量中文，窗口内无内联脚本，由父页面调 print，
+   *            避免 about:blank 继承 CSP 拦截内联 <script> 导致白屏）
+   * ------------------------------------------------------------------ */
+
+  // 把 DOM 节点转成 canvas（SVG foreignObject 方案，无任何外部依赖；作为兜底）
+  function nodeToCanvas(node, w, h, scale) {
+    return new Promise((resolve, reject) => {
+      let xml = '';
+      try { xml = new XMLSerializer().serializeToString(node); }
+      catch (e) { reject(new Error('HTML 序列化失败：' + e.message)); return; }
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (w * scale) + '" height="' + (h * scale) +
+        '" viewBox="0 0 ' + w + ' ' + h + '">' +
+        '<foreignObject x="0" y="0" width="100%" height="100%">' + xml + '</foreignObject></svg>';
+      const img = new Image();
+      img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(w * scale);
+        cv.height = Math.round(h * scale);
+        const ctx = cv.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        try { ctx.drawImage(img, 0, 0, cv.width, cv.height); }
+        catch (e) { reject(new Error('绘制失败：' + e.message)); return; }
+        resolve(cv);
+      };
+      img.onerror = () => reject(new Error('SVG 渲染失败（浏览器不支持或内容含非法标签）'));
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    });
+  }
+
+  // 渲染简历画布：html2canvas 优先，失败退回 SVG foreignObject
   function renderResumeCanvas(opts = {}) {
     const content = getStore(STORE_KEYS.optimized, '');
     if (!content) { toast('还没有优化简历，请先点击「开始优化」', 'err'); return Promise.reject(new Error('no-content')); }
-    if (typeof window.html2canvas !== 'function') {
-      toast('图片渲染库未加载（多为网络受限），请刷新页面重试，或改用「下载 .doc」', 'err');
-      return Promise.reject(new Error('html2canvas-missing'));
-    }
     const theme = opts.theme || getResumeTheme();
+    const scale = opts.scale || 2;
+    // 售卖版激活后会在导出物上带溯源水印（免费版无此函数，为空）
+    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const html = buildResumeHTML(content, theme, { watermark: wm });
+
+    // ① 挂到离屏容器（注意：html 第一个子元素是 <style>，真实纸面是 .rs-wrap，别量错对象）
     const host = document.createElement('div');
-    host.style.cssText = 'position:fixed;left:-10000px;top:0;z-index:-1;opacity:1;';
-    host.innerHTML = buildResumeHTML(content, theme);
+    host.style.cssText = 'position:fixed;left:-10000px;top:0;width:794px;z-index:-1;pointer-events:none;';
+    host.innerHTML = html;
     document.body.appendChild(host);
-    const target = host.firstElementChild;
-    return window.html2canvas(target, {
-      scale: 2, backgroundColor: '#ffffff', useCORS: true, logging: false, imageTimeout: 15000
-    }).then((canvas) => {
-      if (host.parentNode) host.parentNode.removeChild(host);
-      return canvas;
-    }).catch((e) => {
-      if (host.parentNode) host.parentNode.removeChild(host);
-      toast('简历渲染失败：' + ((e && e.message) || '未知错误'), 'err');
-      throw e;
-    });
+    const paper = () => host.querySelector('.rs-wrap') || host.firstElementChild;
+    const h = Math.max(paper().offsetHeight || paper().scrollHeight || 1123, 700);
+
+    const cleanup = () => { if (host.parentNode) host.parentNode.removeChild(host); };
+
+    // ② html2canvas：直接读 DOM 绘制，不经过 data: 图片，不受 CSP 影响
+    const tryH2C = () => {
+      const lib = (typeof html2canvas !== 'undefined') ? html2canvas
+        : (typeof window !== 'undefined' && window.html2canvas);
+      if (typeof lib !== 'function') return Promise.reject(new Error('html2canvas 未加载'));
+      return lib(paper(), {
+        scale, backgroundColor: '#ffffff', logging: false, useCORS: true,
+        width: 794, windowWidth: 794
+      });
+    };
+    // ③ 兜底：SVG foreignObject
+    const trySvg = () => nodeToCanvas(paper(), 794, h, scale);
+
+    return tryH2C()
+      .catch((e1) => trySvg().catch((e2) => {
+        throw new Error((e1 && e1.message ? e1.message : e1) + ' / ' + (e2 && e2.message ? e2.message : e2));
+      }))
+      .then((cv) => { cleanup(); return cv; }, (e) => { cleanup(); throw e; });
   }
 
   function canvasDownload(canvas, fileName) {
     canvas.toBlob((blob) => {
-      if (!blob) { toast('图片生成失败', 'err'); return; }
+      if (!blob) { toast('图片生成失败，请改用「下载 .doc」', 'err'); return; }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = fileName;
@@ -848,51 +1169,114 @@
     }, 'image/png');
   }
 
-  // canvas → 多页 A4 PDF
-  function canvasToPdf(canvas, fileName) {
-    const JSPDF = window.jspdf && window.jspdf.jsPDF;
-    if (!JSPDF) {
-      toast('PDF 库未加载，已改为下载图片', 'err');
-      canvasDownload(canvas, String(fileName).replace(/\.pdf$/i, '.png'));
-      return;
-    }
-    const pdf = new JSPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
-    const pageW = 210, pageH = 297;
-    const imgW = pageW;
-    const imgH = canvas.height * (pageW / canvas.width);
-    const imgData = canvas.toDataURL('image/jpeg', 0.94);
-    let heightLeft = imgH;
-    let position = 0;
-    pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
-    heightLeft -= pageH;
-    while (heightLeft > 0) {
-      position = heightLeft - imgH;
-      pdf.addPage();
-      pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
-      heightLeft -= pageH;
-    }
-    pdf.save(fileName);
+  // jsPDF（由 @require 预载）是否可用
+  function jsPDFLib() {
+    const J = (typeof jspdf !== 'undefined' && jspdf && jspdf.jsPDF) ? jspdf.jsPDF
+      : (typeof window !== 'undefined' && window.jspdf && window.jspdf.jsPDF) ? window.jspdf.jsPDF : null;
+    return J;
+  }
+
+  // 把整条长图画进 A4 竖版 PDF 并保存为真实文件（多页自动切片）
+  function buildResumePdf() {
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    const fileName = `简历-优化-${safeName(meta.title) || '岗位'}.pdf`;
+    return renderResumeCanvas({ scale: 2 }).then((canvas) => {
+      const JsPDF = jsPDFLib();
+      if (!JsPDF) throw new Error('jsPDF 未加载');
+      const PW = 210;                                    // A4 宽 mm
+      const pxPerMm = canvas.width / PW;
+      const pageHpx = Math.max(1, Math.round(297 * pxPerMm)); // 一页 A4 对应的画布像素
+      const pages = Math.max(1, Math.ceil(canvas.height / pageHpx));
+      const doc = new JsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+      const slice = document.createElement('canvas');
+      const sctx = slice.getContext('2d');
+      for (let p = 0; p < pages; p++) {
+        const sy = p * pageHpx;
+        const sh = Math.min(pageHpx, canvas.height - sy);
+        slice.width = canvas.width; slice.height = sh;
+        sctx.fillStyle = '#ffffff'; sctx.fillRect(0, 0, slice.width, slice.height);
+        sctx.drawImage(canvas, 0, sy, canvas.width, sh, 0, 0, canvas.width, sh);
+        const img = slice.toDataURL('image/jpeg', 0.95);
+        if (p > 0) doc.addPage();
+        doc.addImage(img, 'JPEG', 0, 0, PW, (sh / pxPerMm), undefined, 'FAST');
+      }
+      doc.save(fileName);
+      return fileName;
+    });
+  }
+
+  // 生成可打印的 A4 HTML 文档（矢量中文、可搜索；窗口内不含任何内联脚本）
+  function buildPrintDocument(theme, fileName) {
+    const content = getStore(STORE_KEYS.optimized, '');
+    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const inner = buildResumeHTML(content, theme, { watermark: wm });
+    return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>${esc(fileName)}</title>
+<style>
+  *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+  @page{ size:A4; margin:0; }
+  html,body{ margin:0; padding:0; background:#eef2f7;
+             font-family:'Microsoft YaHei','PingFang SC',sans-serif; }
+  .toolbar{ position:sticky; top:0; z-index:9; display:flex; align-items:center; gap:10px;
+            flex-wrap:wrap; padding:12px 18px; background:#0f172a; color:#e2e8f0; font-size:13px; }
+  .toolbar b{ font-size:14px; }
+  .toolbar .hint{ color:#94a3b8; }
+  .stage{ padding:18px 0 30px; }
+  .rs-wrap{ margin:0 auto; box-shadow:0 2px 14px rgba(15,23,42,.14); }
+  @media print{
+    html,body{ background:#fff; }
+    .toolbar{ display:none !important; }
+    .stage{ padding:0; }
+    .rs-wrap{ box-shadow:none; margin:0; width:210mm; }
+    .rs-sec{ break-inside:avoid; page-break-inside:avoid; }
+    .rs-li,.rs-sub,.rs-p{ break-inside:avoid; page-break-inside:avoid; }
+  }
+</style></head>
+<body>
+  <div class="toolbar">
+    <b>📄 ${esc(fileName)}</b>
+    <span class="hint">若未自动弹出打印框：按 Ctrl+P → 目标位置选「另存为 PDF」→ 保存</span>
+  </div>
+  <div class="stage"><div id="resume-root">${inner}</div></div>
+</body></html>`;
+  }
+
+  // 打开打印窗口生成 PDF（窗口由本页代为调起打印，避免新窗口内脚本被 CSP 拦截而白屏）
+  function openResumePrintWindow() {
+    if (!isPro('export')) { showLicenseModal('export', () => openResumePrintWindow()); return; }
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    const fileName = `简历-优化-${safeName(meta.title) || '岗位'}`;
+    const win = window.open('', '_blank');
+    if (!win) { toast('弹窗被拦截：请允许本站弹窗后重试', 'err'); return false; }
+    try {
+      win.document.open();
+      win.document.write(buildPrintDocument(getResumeTheme(), fileName));
+      win.document.close();
+    } catch (e) { return false; }
+    setTimeout(() => { try { win.focus(); win.print(); } catch (e) {} }, 900);
+    return true;
   }
 
   function downloadResumePDF() {
-    if (!isPro()) { showLicenseModal('export', () => downloadResumePDF()); return; }
+    if (!isPro('export')) { showLicenseModal('export', () => downloadResumePDF()); return; }
     if (!getStore(STORE_KEYS.optimized, '')) { toast('还没有优化结果，请先点击「开始优化」', 'err'); return; }
-    toast('正在渲染简历并生成 PDF，请稍候…', 'info');
-    renderResumeCanvas().then((canvas) => {
-      const meta = getStore(STORE_KEYS.jdMeta, {});
-      canvasToPdf(canvas, `简历-优化-${safeName(meta.title)}.pdf`);
-      toast('PDF 已下载', 'ok');
-    }).catch(() => {});
+    toast('正在生成 PDF 文件，请稍候…', 'info');
+    buildResumePdf()
+      .then((f) => toast('✅ 已下载 ' + f + '。需要「文字可复制」的矢量 PDF 可用「打印 / 另存为 PDF」', 'ok'))
+      .catch(() => {
+        toast('PDF 组件不可用（可能断网），已打开打印窗口兜底', 'info');
+        openResumePrintWindow();
+      });
   }
 
   function downloadResumeImage() {
-    if (!isPro()) { showLicenseModal('export', () => downloadResumeImage()); return; }
+    if (!isPro('export')) { showLicenseModal('export', () => downloadResumeImage()); return; }
     if (!getStore(STORE_KEYS.optimized, '')) { toast('还没有优化结果，请先点击「开始优化」', 'err'); return; }
     toast('正在渲染简历图片，请稍候…', 'info');
     renderResumeCanvas().then((canvas) => {
       const meta = getStore(STORE_KEYS.jdMeta, {});
-      canvasDownload(canvas, `简历-优化-${safeName(meta.title)}.png`);
-    }).catch(() => {});
+      canvasDownload(canvas, `简历-优化-${safeName(meta.title) || '岗位'}.png`);
+    }).catch((e) => toast('图片渲染失败：' + (e && e.message || e), 'err'));
   }
 
   /* ============================================================
@@ -939,7 +1323,7 @@
 
   // 把优化后的简历渲染成图片，并附加到当前 HR 对话
   function sendResumeImage() {
-    if (!isPro()) { showLicenseModal('send', () => sendResumeImage()); return; }
+    if (!isPro('send')) { showLicenseModal('send', () => sendResumeImage()); return; }
     const content = getStore(STORE_KEYS.optimized, '');
     if (!content) { toast('还没有优化简历，请先在「优化」页生成', 'err'); UI.switchTab('optimize'); return; }
 
@@ -1002,6 +1386,7 @@
           <div class="brh-tab" data-tab="chat">💬 聊天</div>
           <div class="brh-tab" data-tab="match">🔍 选岗</div>
           <div class="brh-tab" data-tab="settings">⚙️</div>
+          <div class="brh-tab" data-tab="license">🔑</div>
         </div>
         <div class="brh-body" id="brh-body"></div>
       `;
@@ -1045,7 +1430,8 @@
         optimize: () => this.renderOptimizeTab(),
         chat: () => this.renderChatTab(),
         match: () => this.renderMatchTab(),
-        settings: () => this.renderSettingsTab()
+        settings: () => this.renderSettingsTab(),
+        license: () => this.renderLicenseTab()
       };
       body.innerHTML = '';
       (renderers[name] || renderers.jd)();
@@ -1146,14 +1532,18 @@
         <div class="brh-status" id="brh-optimize-status">${content ? '✅ 已有优化结果 ' + nowStr() : ''}</div>
         ${content ? `
         <div class="brh-row">
-          <button class="brh-btn green sm" id="brh-dl-pdf">⬇️ 下载 PDF</button>
-          <button class="brh-btn ghost sm" id="brh-dl-doc">⬇️ 下载 .doc</button>
+          <button class="brh-btn green sm" id="brh-dl-pdf">📄 导出 PDF 文件</button>
+          <button class="brh-btn ghost sm" id="brh-dl-print">🖨 打印 / 另存为 PDF</button>
+        </div>
+        <div class="brh-row">
           <button class="brh-btn ghost sm" id="brh-dl-img">🖼 下载简历图片</button>
+          <button class="brh-btn ghost sm" id="brh-dl-doc">⬇️ 下载 .doc</button>
         </div>
         <div class="brh-row">
           <span class="brh-chip">当前版式：${esc(RESUME_THEMES[getResumeTheme()].name)}</span>
           <button class="brh-btn ghost sm" id="brh-theme-switch">🎨 切换版式</button>
         </div>
+        <div class="brh-tip">「导出 PDF 文件」直接得到 .pdf 文件（多页 A4，自动排版）；需要文字可复制/可搜索的矢量 PDF 时用「打印 / 另存为 PDF」。组件加载失败时自动回退到打印窗口。</div>
         <textarea class="brh-area" id="brh-opt-area" style="min-height:240px">${esc(content)}</textarea>
         <div class="brh-tip">可手动微调后重新下载；发送给 HR 前建议通读一遍，确保经历真实。</div>
         <div class="brh-row" style="margin-top:12px">
@@ -1175,10 +1565,13 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = '🚀 开始优化'; }, 1500);
       };
       const pdfBtn = $('#brh-dl-pdf'); if (pdfBtn) pdfBtn.onclick = downloadResumePDF;
+      const printBtn = $('#brh-dl-print'); if (printBtn) printBtn.onclick = () => { openResumePrintWindow(); };
       const doc = $('#brh-dl-doc'); if (doc) doc.onclick = () => downloadOptimized('doc');
       const imgBtn = $('#brh-dl-img'); if (imgBtn) imgBtn.onclick = downloadResumeImage;
       const ths = $('#brh-theme-switch'); if (ths) ths.onclick = () => {
-        setResumeTheme(getResumeTheme() === 'modern' ? 'business' : 'modern');
+        const order = Object.keys(RESUME_THEMES);
+        const i = order.indexOf(getResumeTheme());
+        setResumeTheme(order[(i + 1) % order.length]);
         const nm = RESUME_THEMES[getResumeTheme()].name;
         toast('已切换为「' + nm + '」版式', 'ok');
         this.renderOptimized(getStore(STORE_KEYS.optimized, ''));
@@ -1213,6 +1606,8 @@
       const body = $('#brh-body', this.root);
       const optimized = getStore(STORE_KEYS.optimized, '');
       const isChat = /\/web\/geek\/chat|\/chat/.test(location.pathname);
+      const hrQ = getStore(STORE_KEYS.hrQuestion, '');
+      const hrA = getStore(STORE_KEYS.hrReply, '');
       body.innerHTML = `
         <div class="brh-row">
           <span class="brh-chip">优化简历 ${optimized ? '已就绪' : '未生成'}</span>
@@ -1226,19 +1621,51 @@
         <textarea class="brh-area" id="brh-greet-area" style="min-height:110px">${esc(content)}</textarea>
         <div class="brh-row" style="margin-top:8px">
           <button class="brh-btn green" id="brh-fill">📝 填入聊天框</button>
+          <button class="brh-btn warn sm" id="brh-attach" ${optimized ? '' : 'disabled'}>🖼 向当前对话发送简历图片</button>
         </div>
-        <div class="brh-row" style="margin-top:10px">
-          <button class="brh-btn warn" id="brh-attach" ${optimized ? '' : 'disabled'}>🖼 向当前对话发送简历图片</button>
-        </div>
-        <div class="brh-tip">提示：填入话术后请人工检查再发送。简历会以<b>图片</b>形式附加（排版好看、手机端不乱码）；若页面拦截自动附加，脚本会自动把图片下载到本地，你手动点聊天窗口「图片」按钮发送即可。版式可在「✨ 优化」页切换。</div>` : `
+        <div class="brh-tip">简历以<b>图片</b>形式附加（排版好看、手机端不乱码）；若页面拦截自动附加，图片会自动下载到本地，手动点聊天窗口「图片」按钮发送即可。</div>` : `
         <div class="brh-tip">先生成打招呼话术；然后可一键填入 Boss 聊天框，并把优化后的简历以图片形式发给当前 HR。</div>`}
-      `;
+
+        <div class="brh-row" style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
+          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 提问 + 优化简历生成</span></div>
+          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新提问；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn" id="brh-hr-gen" ${optimized ? '' : 'disabled title="请先在「优化」页生成优化简历"'}>💬 生成针对性回复</button>
+            ${hrA ? '<button class="brh-btn ghost sm" id="brh-hr-regen">🔄 换个说法</button>' : ''}
+          </div>
+          ${hrA ? `
+          <textarea class="brh-area" id="brh-hr-reply" style="min-height:110px;margin-top:8px">${esc(hrA)}</textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn green sm" id="brh-hr-copy">📋 复制回复</button>
+            <button class="brh-btn sm" id="brh-hr-fill">📝 填入聊天框</button>
+          </div>` : ''}
+          <div class="brh-tip">在 HR 聊天页点「生成针对性回复」，脚本会读取 HR 最新提问，结合优化后的简历与岗位 JD 生成第一人称回复；生成后请核对数字与事实再发送。</div>
+        </div>`;
       const gen = $('#brh-gen-greeting'); if (gen) gen.onclick = generateGreeting;
       const area = $('#brh-greet-area');
       if (area) area.addEventListener('change', (e) => setStore(STORE_KEYS.greeting, e.target.value));
       const fill = $('#brh-fill'); if (fill) fill.onclick = () => fillGreeting($('#brh-greet-area').value.trim());
       const attach = $('#brh-attach'); if (attach) attach.onclick = sendResumeImage;
+      const hrGen = $('#brh-hr-gen'); if (hrGen) hrGen.onclick = () => {
+        setStore(STORE_KEYS.hrQuestion, $('#brh-hr-q').value.trim());
+        generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
+      };
+      const hrRegen = $('#brh-hr-regen'); if (hrRegen) hrRegen.onclick = () => generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
+      const hrCopy = $('#brh-hr-copy'); if (hrCopy) hrCopy.onclick = () => {
+        const v = $('#brh-hr-reply').value.trim();
+        if (!v) { toast('暂无回复', 'err'); return; }
+        navigator.clipboard.writeText(v).then(() => toast('回复已复制', 'ok'), () => toast('复制失败，请手动选择', 'err'));
+      };
+      const hrFill = $('#brh-hr-fill'); if (hrFill) hrFill.onclick = () => {
+        setStore(STORE_KEYS.hrReply, $('#brh-hr-reply').value);
+        fillGreeting($('#brh-hr-reply').value.trim());
+      };
+      const hrQArea = $('#brh-hr-q');
+      if (hrQArea) hrQArea.addEventListener('change', (e) => setStore(STORE_KEYS.hrQuestion, e.target.value.trim()));
     },
+
+    /* HR 智能回复生成完毕后刷新聊天页（问题与回复已入存储） */
+    renderHrReply() { this.renderGreeting(getStore(STORE_KEYS.greeting, '')); },
 
     /* ---- 选岗页 ---- */
     renderMatchTab() {
@@ -1281,6 +1708,13 @@
       }
     },
 
+    /* ---- 激活授权页（售卖版专属） ---- */
+    renderLicenseTab() {
+      const body = $('#brh-body', this.root);
+      body.innerHTML = licenseTabHTML();
+      bindLicenseTab(() => this.renderLicenseTab());
+    },
+
     /* ---- 设置页 ---- */
     renderSettingsTab() {
       const body = $('#brh-body', this.root);
@@ -1311,6 +1745,10 @@
           <select class="brh-input" id="brh-cfg-theme" style="height:30px">
             <option value="modern" ${getResumeTheme() === 'modern' ? 'selected' : ''}>现代简约（白底 + 主色标题条，通用推荐）</option>
             <option value="business" ${getResumeTheme() === 'business' ? 'selected' : ''}>深色商务（深蓝侧边栏，视觉冲击强）</option>
+            <option value="elegant" ${getResumeTheme() === 'elegant' ? 'selected' : ''}>雅致衬线（居中标题 + 衬线字，稳重耐看）</option>
+            <option value="ocean" ${getResumeTheme() === 'ocean' ? 'selected' : ''}>深海渐变（渐变横幅头部，个性醒目）</option>
+            <option value="vitality" ${getResumeTheme() === 'vitality' ? 'selected' : ''}>活力橙红（时间线经历，突出成长）</option>
+            <option value="jade" ${getResumeTheme() === 'jade' ? 'selected' : ''}>青玉留白（极简双线，清爽克制）</option>
           </select>
         </div>
         <div class="brh-row">
@@ -1336,15 +1774,7 @@
           resumeTheme: th,
           updateUrl: $('#brh-cfg-updateurl') ? $('#brh-cfg-updateurl').value.trim() : ''
         });
-        const licVal = $('#brh-cfg-license').value.trim();
-        setStore(STORE_KEYS.license, licVal);
-        if (!licVal) {
-          this.showStatus('brh-cfg', '✅ 已保存（未激活，付费功能仍锁定）', 'ok');
-        } else {
-          const lr = BRH_LIC.checkCode(licVal);
-          if (lr.ok) { this.showStatus('brh-cfg', '✅ 已保存并激活（' + (lr.expText || '') + '）', 'ok'); }
-          else { this.showStatus('brh-cfg', '⚠️ 已保存，但激活码无效：' + lr.reason, 'err'); }
-        }
+        this.showStatus('brh-cfg', '✅ 已保存', 'ok');
       };
       $('#brh-cfg-test').onclick = () => {
         const th2 = $('#brh-cfg-theme') ? $('#brh-cfg-theme').value : getResumeTheme();
@@ -1363,19 +1793,8 @@
       };
       $('#brh-check-update').onclick = () => checkUpdate(false);
       $('#brh-tpl-manage').onclick = () => this.renderTemplateManager();
-      const licBuy2 = $('#brh-lic-buy2');
-      if (licBuy2) licBuy2.onclick = () => window.open(LICENSE_PAGE, '_blank');
-      const licAct = $('#brh-lic-act');
-      if (licAct) licAct.onclick = () => {
-        const v = $('#brh-cfg-license').value.trim();
-        if (!v) { this.showStatus('brh-cfg', '请先粘贴激活码', 'err'); return; }
-        saveLicense(v, (r) => {
-          if (!r || !r.ok) { this.showStatus('brh-cfg', '❌ ' + ((r && r.reason) || '激活失败'), 'err'); return; }
-          this.showStatus('brh-cfg', '✅ 激活成功' + (r.expText ? '（' + r.expText + '）' : '') + (r.warn ? ' · ' + r.warn : ''), 'ok');
-          toast('✅ 激活成功', 'ok');
-          this.renderSettingsTab();
-        });
-      };
+      const licGoto = $('#brh-lic-goto');
+      if (licGoto) licGoto.onclick = () => this.switchTab('license');
     },
 
     /* ---- 话术模板管理 ---- */
@@ -1450,35 +1869,50 @@
    * 6.5 云端更新检查与授权
    * ========================================================== */
 
-  /* ---- 激活码算法（由 sell-kit/license-core.js 注入，勿手改） ---- */
+  /* ---- 授权验签模块（由 sell-kit/license-verify.js 注入，勿手改；仅公钥验签） ---- */
 /* ============================================================
- * license-core.js — Boss招聘小助手 · 激活码算法（唯一算法源）
+ * license-verify.js — Boss招聘小助手 · 授权凭证「只验不发」模块
  *
- * 本文件同时被以下两处使用，改这里即全局生效：
- *   1) 油猴售卖版脚本（由 make-sell.js 注入，暴露为 window.BRHLicense）
- *   2) 在线激活网页 activate.html（由 build-activate.js 内联进去）
+ * 本文件同时被以下两处使用（均不含私钥 / 短码密钥 / 发码算法，可公开分发）：
+ *   1) 油猴售卖版脚本（由 make-sell.js 注入，暴露 BRH_VERIFY）
+ *   2) 买家激活网页 activate.html（由 build-activate.js 内联）
  *
- * ⚠️ 修改 SECRET 后，此前发出的激活码会全部失效，请谨慎。
+ * 授权机制（v2 · 非对称签名）：
+ *   - 作者在本地（admin.html）用「ECDSA P-256 私钥」为买家签发激活凭证：
+ *       BRHT1.<payload base64url>.<signature base64url>
+ *     payload = {"v":1,"c":"BRH-XXXX-XXXX-XXXX"(关联码,可空),"d":"设备指纹"(空=不绑设备),
+ *                "e":到期毫秒(0=永久),"f":["all"或功能数组],"i":签发毫秒,"o":备注(可空)}
+ *   - 脚本 / 激活页只内嵌「公钥」做本地验签 —— 买家拿不到私钥，无法伪造或自制凭证。
+ *   - 凭证绑定设备指纹：转发给他人时设备不匹配 → 拒绝激活（防倒卖）。
+ *   - 凭证自带功能档位（f 字段）：不同价位开放不同付费功能（功能权限）。
  *
- * 激活码结构：BRH-XXXX-XXXX-XXXX
- *   payload = 前两段 8 字符：
- *     [0..1] 有效期：00 = 永久；否则为 (年-2026)*12 + 月 + 1 的 Base32(2位)
- *     [2..7] 随机串（Crockford Base32，去掉易混淆的 I L O U）
- *   check   = 第三段 4 字符：HMAC-SHA256(SECRET, payload) 取 4 位摘要
+ * ⚠️ 首次使用：先运行 sell-kit/keygen.js 生成密钥对，
+ *    把输出的公钥 JWK 粘贴到下方 BRH_PUB_KEY，然后重跑 make-sell.js / build-activate.js。
  * ========================================================== */
 (function (root, factory) {
   var api = factory();
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  else root.BRHLicense = api;
+  else root.BRH_VERIFY = api;
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  /* ---------------- 可调参数 ---------------- */
-  var SECRET = 'brh-2026-zq17-8f3a9c';                 // ← 作者密钥（建议改成只有你知道的字符串）
-  var ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';   // Crockford Base32（无 I / L / O / U）
-  var BASE_YEAR = 2026;
+  /* ---------------- 作者公钥（可公开；换密钥需重跑构建） ----------------
+   * 由 sell-kit/keygen.js 生成后粘贴到这里（JWK 对象）。
+   * 为 null 时验签不可用，会明确提示作者尚未配置密钥。 */
+  var BRH_PUB_KEY = {"key_ops":["verify"],"ext":true,"kty":"EC","x":"4t6AIufRGx3Ufo6i0HboP1m_NsmdlsFtPPU3eQj5-F4","y":"s1d04TTl16PpwKIuP7vhB_xoYh9rbMi3CYUKZntdJx8","crv":"P-256"}; /* 例：{"kty":"EC","crv":"P-256","x":"...","y":"..."} */
 
-  /* ---------------- 工具 ---------------- */
+  /* ---------------- 凭证与格式 ---------------- */
+  var TOKEN_PREFIX = 'BRHT1.';
+  var OLD_CODE_RE = /^BRH-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$/;
+
+  function b64urlToBytes(s) {
+    var t = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    var bin = atob(t);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
   function utf8(str) {
     if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
     var out = [], i, c;
@@ -1490,190 +1924,206 @@
     }
     return new Uint8Array(out);
   }
-  function ror(x, n) { return (x >>> n) | (x << (32 - n)); }
-  function b32(num, len) {
-    var s = '';
-    for (var i = len - 1; i >= 0; i--) s += ALPHABET[(num >>> (i * 5)) & 31];
-    return s;
-  }
-  function fromB32(s) {
-    var v = 0;
-    for (var i = 0; i < s.length; i++) {
-      var idx = ALPHABET.indexOf(s[i]);
-      if (idx < 0) return -1;
-      v = v * 32 + idx;
-    }
-    return v;
-  }
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
   function fmtDate(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
 
-  /* ---------------- SHA-256 & HMAC ---------------- */
-  var K = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-  ];
-
-  function sha256(msgBytes) {
-    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    var len = msgBytes.length;
-    var blocks = Math.ceil((len + 9) / 64);
-    var total = blocks * 64;
-    var buf = new Uint8Array(total);
-    buf.set(msgBytes);
-    buf[len] = 0x80;
-    var dv = new DataView(buf.buffer);
-    var bitLen = len * 8;
-    dv.setUint32(total - 8, Math.floor(bitLen / 4294967296));
-    dv.setUint32(total - 4, bitLen >>> 0);
-    var w = new Int32Array(64);
-    var i, t;
-    for (var b = 0; b < blocks; b++) {
-      var off = b * 64;
-      for (i = 0; i < 16; i++) w[i] = dv.getInt32(off + i * 4);
-      for (i = 16; i < 64; i++) {
-        var x15 = w[i - 15], x2 = w[i - 2];
-        var s0 = ror(x15, 7) ^ ror(x15, 18) ^ (x15 >>> 3);
-        var s1 = ror(x2, 17) ^ ror(x2, 19) ^ (x2 >>> 10);
-        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+  /* ---------------- 跨场景小存储（油猴 GM / 网页 localStorage / 内存） ---------------- */
+  function stGet(key) {
+    try {
+      if (typeof GM_getValue === 'function') { var v = GM_getValue(key); return v == null ? null : v; }
+      if (typeof localStorage !== 'undefined') return localStorage.getItem(key);
+    } catch (e) {}
+    return (root.__BRH_MEM_STORE__ || {})[key] || null;
+  }
+  function stSet(key, val) {
+    try {
+      if (typeof GM_setValue === 'function') { GM_setValue(key, val); return; }
+      if (typeof localStorage !== 'undefined') {
+        if (val == null) localStorage.removeItem(key); else localStorage.setItem(key, String(val));
+        return;
       }
-      var a = H[0], bb = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
-      for (i = 0; i < 64; i++) {
-        var S1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25);
-        var ch = (e & f) ^ (~e & g);
-        var t1 = (h + S1 + ch + K[i] + w[i]) | 0;
-        var S0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22);
-        var maj = (a & bb) ^ (a & c) ^ (bb & c);
-        var t2 = (S0 + maj) | 0;
-        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+    } catch (e) {}
+    if (!root.__BRH_MEM_STORE__) root.__BRH_MEM_STORE__ = {};
+    root.__BRH_MEM_STORE__[key] = val;
+  }
+
+  /* ---------------- 设备指纹（脚本与激活页用同一算法，同一浏览器结果一致） ----------------
+   * 只取跨版本相对稳定的属性（刻意不含 UA 版本号），浏览器大改或换机才会变化；
+   * 变化后联系作者换发凭证即可（admin.html 支持重签）。 */
+  function deviceFingerprint() {
+    try {
+      var n = typeof navigator !== 'undefined' ? navigator : {};
+      var s = typeof screen !== 'undefined' ? screen : {};
+      var parts = [
+        n.platform || '', n.language || '',
+        (function () { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; } })(),
+        s.width + 'x' + s.height + '@' + (s.colorDepth || ''),
+        (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1),
+        n.hardwareConcurrency || '',
+        n.deviceMemory || '',
+        n.maxTouchPoints || 0
+      ].join('|');
+      var h1 = 0x811c9dc5, h2 = 0xc2b2ae35, i;
+      for (i = 0; i < parts.length; i++) {
+        h1 = ((h1 ^ parts.charCodeAt(i)) * 16777619) >>> 0;
+        h2 = ((h2 + parts.charCodeAt(i) * (i + 7)) * 2654435761) >>> 0;
       }
-      H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
-      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+      return ('0000000' + h1.toString(16)).slice(-8).toUpperCase() + ('0000000' + h2.toString(16)).slice(-8).toUpperCase();
+    } catch (e) { return 'FFFFFFFFFFFFFFFF'; }
+  }
+
+  /** 稳定的本机设备标识（首次生成随机 UUID 存本地，用于本地自检展示） */
+  function deviceId() {
+    var k = 'brh_device_uuid';
+    var v = stGet(k);
+    if (!v) {
+      v = '';
+      try {
+        var arr = new Uint8Array(16);
+        (typeof crypto !== 'undefined' && crypto.getRandomValues) ? crypto.getRandomValues(arr)
+          : (function () { for (var i = 0; i < 16; i++) arr[i] = Math.floor(Math.random() * 256); })();
+        for (var i = 0; i < 16; i++) v += (arr[i] | 0x100).toString(16).slice(1);
+      } catch (e) { v = String(Date.now()) + Math.random().toString(16).slice(2); }
+      stSet(k, v);
     }
-    var out = new Uint8Array(32);
-    for (i = 0; i < 8; i++) {
-      out[i * 4] = (H[i] >>> 24) & 0xff;
-      out[i * 4 + 1] = (H[i] >>> 16) & 0xff;
-      out[i * 4 + 2] = (H[i] >>> 8) & 0xff;
-      out[i * 4 + 3] = H[i] & 0xff;
+    return v;
+  }
+
+  /** 买家报给作者的「设备指纹」（8+8 位，签发时绑定用） */
+  function deviceShortId() { return deviceFingerprint(); }
+
+  /* ---------------- 凭证解析（同步，不验签名，仅用于 UI 预览 / 预检） ---------------- */
+  function parseTokenInfo(raw) {
+    var token = String(raw == null ? '' : raw).trim().replace(/\s+/g, '');
+    if (OLD_CODE_RE.test(token.toUpperCase())) {
+      return { kind: 'old-code', ok: false, code: token.toUpperCase(),
+        reason: '这是旧版激活码。授权机制已升级为「激活凭证」，请联系作者换发（把设备指纹发给作者即可）。' };
     }
-    return out;
-  }
-
-  function hmacBytes(keyStr, msgStr) {
-    var B = 64;
-    var key = utf8(keyStr);
-    if (key.length > B) key = sha256(key);
-    var pad = new Uint8Array(B);
-    pad.set(key);
-    var o = new Uint8Array(B), iPad = new Uint8Array(B);
-    for (var j = 0; j < B; j++) { o[j] = pad[j] ^ 0x5c; iPad[j] = pad[j] ^ 0x36; }
-    var inner = new Uint8Array(B + utf8(msgStr).length);
-    inner.set(iPad);
-    inner.set(utf8(msgStr), B);
-    var outer = new Uint8Array(B + 32);
-    outer.set(o);
-    outer.set(sha256(inner), B);
-    return sha256(outer);
-  }
-
-  /* ---------------- 有效期编解码 ---------------- */
-  function encodeExp(dateOrNull) {
-    if (!dateOrNull) return '00';
-    var v = (dateOrNull.getFullYear() - BASE_YEAR) * 12 + dateOrNull.getMonth() + 1;
-    if (v > 1023) v = 1023;
-    return b32(v, 2);
-  }
-  function decodeExp(tag) {
-    if (tag === '00') return null;
-    var v = fromB32(tag);
-    if (v <= 0) return null;
-    var t = v - 1;
-    var y = BASE_YEAR + Math.floor(t / 12);
-    var m = t % 12;
-    return new Date(y, m + 1, 0, 23, 59, 59); // 当月最后一天 23:59:59
-  }
-
-  /* ---------------- 激活码生成 / 校验 ---------------- */
-  function checksum(payload) {
-    var h = hmacBytes(SECRET, payload);
-    var s = '';
-    for (var i = 0; i < 4; i++) s += ALPHABET[h[i * 3 + 1] % 32];
-    return s;
-  }
-
-  function randomChars(n) {
-    var s = '';
-    for (var i = 0; i < n; i++) s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-    return s;
-  }
-
-  function genCode(expDate) {
-    var payload = encodeExp(expDate || null) + randomChars(6);
-    return 'BRH-' + payload.slice(0, 4) + '-' + payload.slice(4, 8) + '-' + checksum(payload);
-  }
-
-  /**
-   * @returns {{ok:boolean, reason?:string, exp?:number, expText?:string, expired?:boolean}}
-   */
-  function checkCode(raw) {
-    var code = String(raw == null ? '' : raw).trim().toUpperCase().replace(/\s+/g, '');
-    var m = /^BRH-([0-9A-Z]{4})-([0-9A-Z]{4})-([0-9A-Z]{4})$/.exec(code);
-    if (!m) return { ok: false, reason: '格式不正确（应为 BRH-XXXX-XXXX-XXXX）' };
-    var payload = m[1] + m[2];
-    for (var i = 0; i < payload.length; i++) {
-      if (ALPHABET.indexOf(payload[i]) < 0) return { ok: false, reason: '包含无效字符（不含 I L O U）' };
+    if (token.indexOf(TOKEN_PREFIX) !== 0) {
+      return { kind: 'unknown', ok: false, reason: '格式不正确：激活凭证应以 BRHT1. 开头（从作者消息中完整复制，含 BRHT1. 前缀）' };
     }
-    if (checksum(payload) !== m[3]) return { ok: false, reason: '激活码无效（校验失败）' };
-    var expDate = decodeExp(payload.slice(0, 2));
-    if (expDate && Date.now() > expDate.getTime()) {
-      return { ok: false, expired: true, reason: '激活码已过期（有效期至 ' + fmtDate(expDate) + '）' };
-    }
+    var rest = token.slice(TOKEN_PREFIX.length);
+    var dot = rest.lastIndexOf('.');
+    if (dot < 0) return { kind: 'token', ok: false, reason: '凭证不完整（缺少签名段），请完整复制' };
+    var payloadB64 = rest.slice(0, dot);
+    var sigB64 = rest.slice(dot + 1);
+    var p;
+    try { p = JSON.parse(new TextDecoder('utf-8').decode(b64urlToBytes(payloadB64))); }
+    catch (e) { return { kind: 'token', ok: false, reason: '凭证内容损坏，请完整重新复制' }; }
+    var exp = p.e || 0;
+    var expired = !!exp && Date.now() > exp;
     return {
-      ok: true,
-      code: code,
-      exp: expDate ? expDate.getTime() : 0,
-      expText: expDate ? ('有效期至 ' + fmtDate(expDate)) : '永久有效'
+      kind: 'token', ok: !expired, expired: expired,
+      token: token, payload: p, sigB64: sigB64,
+      code: p.c || '', device: p.d || '', features: p.f || ['all'],
+      exp: exp, iat: p.i || 0, note: p.o || '',
+      expText: exp ? ('有效期至 ' + fmtDate(new Date(exp))) : '永久有效',
+      reason: expired ? ('凭证已过期（' + fmtDate(new Date(exp)) + '），请联系作者续期') : ''
     };
   }
 
+  /** 更新验签公钥（admin.html 生成密钥对后立即生效；构建时也可用字符串替换预置） */
+  function setPublicJwk(jwk) { BRH_PUB_KEY = jwk; }
+  function getPublicJwk() { return BRH_PUB_KEY; }
+  function checkFormat(raw) {
+    var t = String(raw == null ? '' : raw).trim();
+    if (!t) return { ok: false, reason: '未填写' };
+    var info = parseTokenInfo(t);
+    if (info.kind === 'old-code') return { ok: false, oldCode: true, reason: info.reason };
+    return info.ok ? { ok: true } : { ok: false, reason: info.reason || '格式不正确' };
+  }
+
+  /* ---------------- ECDSA P-256 验签（WebCrypto，异步） ---------------- */
+  function subtle() {
+    if (typeof crypto !== 'undefined' && crypto.subtle) return crypto.subtle;
+    if (root.__BRH_NODE_SUBTLE__) return root.__BRH_NODE_SUBTLE__;
+    return null;
+  }
+
+  /**
+   * 完整验证：验签 + 过期 + （可选）设备绑定检查
+   * @returns {Promise<{ok:boolean, reason?:string, info?:object}>}
+   */
+  function verifyToken(raw, opts) {
+    opts = opts || {};
+    return new Promise((resolve) => {
+      var info = parseTokenInfo(raw);
+      if (!info.ok && info.kind !== 'token') return resolve({ ok: false, reason: info.reason });
+      if (info.ok === false && info.expired) return resolve({ ok: false, reason: info.reason, info });
+      if (!BRH_PUB_KEY) return resolve({ ok: false, reason: '作者尚未配置验签公钥（BRH_PUB_KEY），请更新脚本/激活页' });
+      var s = subtle();
+      if (!s) return resolve({ ok: false, reason: '当前环境不支持 WebCrypto（需 HTTPS 或本地 file:// 打开）' });
+      var pubJwk = (typeof BRH_PUB_KEY === 'string') ? JSON.parse(BRH_PUB_KEY) : BRH_PUB_KEY;
+      var token = info.token;
+      var rest = token.slice(TOKEN_PREFIX.length);
+      var signedPart = utf8(rest.slice(0, rest.lastIndexOf('.')));
+      var sigBytes = b64urlToBytes(info.sigB64);
+      s.importKey('jwk', pubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+        .then((key) => s.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sigBytes, signedPart))
+        .then((good) => {
+          if (!good) return resolve({ ok: false, reason: '凭证签名无效（可能被篡改或伪造）', info });
+          if (!opts.skipDevice) {
+            if (info.device && info.device !== deviceFingerprint()) {
+              return resolve({ ok: false, deviceMismatch: true, reason: '该凭证绑定了其他设备（指纹 ' + info.device.slice(0, 8) + '…）。本机指纹 ' + deviceShortId() + '，请把它发给作者换发。', info });
+            }
+          }
+          resolve({ ok: true, info });
+        })
+        .catch((e) => resolve({ ok: false, reason: '验签失败：' + (e && e.message || e) }));
+    });
+  }
+
+  /** 功能清单（与脚本内 GUARD_FEATURES 对应） */
+  var FEATURE_KEYS = ['optimize', 'match', 'greeting', 'export', 'send'];
+  var FEATURE_NAMES = {
+    optimize: 'AI 简历优化', match: '岗位扫描匹配', greeting: 'AI 话术生成',
+    export: 'PDF / 图片导出', send: '简历图片发送', all: '全部功能'
+  };
+  function featureText(features) {
+    if (!features || features.indexOf('all') >= 0) return '全部功能（专业版）';
+    return features.map((f) => FEATURE_NAMES[f] || f).join('、') || '未指定';
+  }
+  function hasFeature(features, key) {
+    return !!features && (features.indexOf('all') >= 0 || features.indexOf(key) >= 0);
+  }
+
   return {
-    SECRET: SECRET,
-    ALPHABET: ALPHABET,
-    BASE_YEAR: BASE_YEAR,
-    genCode: genCode,
-    checkCode: checkCode,
-    encodeExp: encodeExp,
-    decodeExp: decodeExp,
+    PUB_KEY: BRH_PUB_KEY,
+    TOKEN_PREFIX: TOKEN_PREFIX,
+    FEATURE_KEYS: FEATURE_KEYS,
+    FEATURE_NAMES: FEATURE_NAMES,
+    featureText: featureText,
+    hasFeature: hasFeature,
+    parseTokenInfo: parseTokenInfo,
+    checkFormat: checkFormat,
+    verifyToken: verifyToken,
+    setPublicJwk: setPublicJwk,
+    getPublicJwk: getPublicJwk,
+    deviceFingerprint: deviceFingerprint,
+    deviceShortId: deviceShortId,
+    deviceId: deviceId,
     fmtDate: fmtDate,
-    parseExpChoice: function (choice) {   // 'perm' | '30' | '90' | '180' | '365'
-      if (!choice || choice === 'perm') return null;
-      var d = new Date();
-      d.setDate(d.getDate() + parseInt(choice, 10));
-      return d;
-    }
+    stGet: stGet,
+    stSet: stSet
   };
 });
 
-  const BRH_LIC = (typeof self !== 'undefined' ? self : window).BRHLicense;
+  const BRH_VERIFY = (typeof self !== 'undefined' ? self : window).BRH_VERIFY;
 
   /* ===== BEGIN BRH LICENSE MODULE (授权版专用 · 由 make-sell.js 注入，请勿手改) =====
-   * 付费功能拦截点：optimizeResume / runMatch / generateGreeting /
-   *                 downloadResumePDF / downloadResumeImage / sendResumeImage
-   * 想调整哪些功能收费，改这 6 个函数开头的 requirePro(...) 一行即可。
+   * 授权机制（v2 · 非对称签名）：
+   *   买家拿到的是作者本地签发的「激活凭证」BRHT1.<payload>.<sig>（ECDSA P-256 签名），
+   *   本模块只做「验签 + 设备绑定 + 功能档位」校验，不含任何发码算法与密钥。
+   *   - 凭证绑定设备指纹：转发给他人 → 设备不匹配 → 拒绝激活（防倒卖）。
+   *   - 凭证自带功能档位（f 字段）：按购买档位开放付费功能（防止一个码解锁全部）。
+   *   - 激活后导出的 PDF / 图片自动带溯源水印（防倒卖追责）。
+   * 拦截点：optimizeResume / runMatch / generateGreeting /
+   *         downloadResumePDF / downloadResumeImage / sendResumeImage
    * ============================================================================== */
 
-  /** 在线激活网页地址（脚本内「获取激活码」按钮会打开它）
-   *  默认用 Gitee Pages：需在 Gitee 仓库 → 服务 → Gitee Pages 部署一次（目录选根目录）。
-   *  换其他托管（Vercel / 自有域名）时改这里，然后重跑 make-sell.js。 */
+  /** 买家激活中心网页（「获取授权」按钮会打开它） */
   const LICENSE_PAGE = 'https://zzc356.gitee.io/boss-recruit-helper/activate.html';
-  /** 可选：远程授权接口。留空 = 纯离线校验；填了则激活时多一道服务端校验（返回 {ok:true/false,msg}） */
+  /** 可选：远程授权接口（license-server-example.js）。留空 = 纯离线验签 */
   const LICENSE_API = '';
 
   const GUARD_FEATURES = {
@@ -1684,83 +2134,150 @@
     send: '简历图片发送'
   };
 
-  /** 本机机器码（8 位，便于按设备发码 / 排查问题，当前不强制绑定） */
-  function machineId() {
-    try {
-      const raw = [navigator.userAgent, navigator.language, screen.width + 'x' + screen.height, new Date().getTimezoneOffset()].join('|');
-      let h = 5381;
-      for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) | 0;
-      return (h >>> 0).toString(16).toUpperCase().padStart(8, '0');
-    } catch (e) { return '--------'; }
+  /** 本机设备指纹（与 activate.html / 作者发码台同算法；签发凭证时绑定用） */
+  function deviceTag() { return BRH_VERIFY.deviceShortId(); }
+
+  /* ---------------- 授权状态（异步验签一次，结果缓存供同步判断） ---------------- */
+  let LIC_CACHE = { checked: false, ok: false, features: [], reason: '' };
+
+  /** 重新校验本地保存的凭证（启动 / 激活后调用；验签是异步的） */
+  function refreshLicense() {
+    return new Promise((resolve) => {
+      const token = String(getStore(STORE_KEYS.license, '') || '').trim();
+      if (!token) {
+        LIC_CACHE = { checked: true, ok: false, features: [], reason: '' };
+        return resolve(LIC_CACHE);
+      }
+      BRH_VERIFY.verifyToken(token).then((r) => {
+        if (r.ok) {
+          LIC_CACHE = { checked: true, ok: true, features: r.info.features || ['all'],
+                        exp: r.info.exp, expText: r.info.expText, note: r.info.note || '', reason: '' };
+        } else {
+          // 校验失败（签名无效 / 已过期 / 设备不匹配）：保留原值便于联系作者排查，但状态置为无效
+          LIC_CACHE = { checked: true, ok: false, features: [], reason: (r && r.reason) || '凭证无效' };
+        }
+        resolve(LIC_CACHE);
+      });
+    });
   }
 
-  /** 当前授权状态 */
+  /** 同步读取当前授权状态（UI 用；数据来自最近一次 refreshLicense 的验签结果） */
   function licState() {
-    const code = getStore(STORE_KEYS.license, '').trim();
-    if (!code) return { ok: false, code: '', text: '未激活', sub: 'AI 优化 / 选岗 / 发送简历 等付费功能已锁定' };
-    const r = BRH_LIC.checkCode(code);
-    if (!r.ok) return { ok: false, code, text: '授权无效', sub: r.reason };
-    return { ok: true, code, text: r.exp ? ('已激活 · ' + r.expText) : '已激活 · 永久有效', sub: '' };
+    const token = String(getStore(STORE_KEYS.license, '') || '').trim();
+    if (!token) return { ok: false, code: '', text: '未激活', sub: 'AI 优化 / 选岗 / 导出 / 发送简历 等付费功能已锁定', features: [] };
+    const c = LIC_CACHE;
+    if (c.checked && c.ok) {
+      // 已过缓存有效期判断：过期时间到了即使缓存没刷新也立即失效
+      if (c.exp && Date.now() > c.exp) {
+        return { ok: false, code: token, text: '授权已过期', sub: '有效期至 ' + BRH_VERIFY.fmtDate(new Date(c.exp)) + '，请联系作者续期', features: [] };
+      }
+      return { ok: true, code: token, text: '已激活 · ' + (c.exp ? c.expText : '永久有效'),
+               sub: BRH_VERIFY.featureText(c.features), features: c.features, note: c.note };
+    }
+    if (c.checked && c.reason) return { ok: false, code: token, text: '授权无效', sub: c.reason, features: [] };
+    return { ok: false, code: token, text: '校验中…', sub: '正在验证授权凭证', features: [] };
   }
-  function isPro() { return licState().ok; }
 
-  /** 可选的服务端校验：未配置接口或网络异常时按离线结果放行，避免误伤已付费用户 */
-  function onlineVerify(code, cb) {
+  /** 当前凭证是否解锁某功能（featureKey 缺省 = 只看是否激活） */
+  function isPro(featureKey) {
+    const s = licState();
+    if (!s.ok) return false;
+    if (!featureKey) return true;
+    return BRH_VERIFY.hasFeature(s.features, featureKey);
+  }
+
+  /** 溯源水印文本（激活后导出 PDF / 图片时打在文件上，防止转卖后无法追责） */
+  function getLicenseWatermark() {
+    const s = licState();
+    if (!s.ok) return '';
+    const info = BRH_VERIFY.parseTokenInfo(s.code);
+    const tag = info && info.payload && info.payload.c ? info.payload.c : '';
+    return ('授权 ' + tag + ' · ' + deviceTag()).trim();
+  }
+
+  /* ---------------- 可选服务端二次校验（离线优先，失败不误伤） ---------------- */
+  function onlineVerify(token, cb) {
     if (!LICENSE_API) return cb({ ok: true });
     try {
       GM_xmlhttpRequest({
         method: 'POST', url: LICENSE_API, timeout: 10000,
         headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ code: code, machine: machineId(), version: VERSION }),
+        data: JSON.stringify({ token: token, device: deviceTag(), version: VERSION }),
         onload(res) {
           try { cb(JSON.parse(res.responseText || '{}')); }
-          catch (e) { cb({ ok: true, warn: '授权服务器返回异常，已按离线校验放行' }); }
+          catch (e) { cb({ ok: true, warn: '授权服务器返回异常，已按离线验签放行' }); }
         },
-        onerror() { cb({ ok: true, warn: '授权服务器不可达，已按离线校验放行' }); },
-        ontimeout() { cb({ ok: true, warn: '授权校验超时，已按离线校验放行' }); }
+        onerror() { cb({ ok: true, warn: '授权服务器不可达，已按离线验签放行' }); },
+        ontimeout() { cb({ ok: true, warn: '授权校验超时，已按离线验签放行' }); }
       });
     } catch (e) { cb({ ok: true }); }
   }
 
-  /** 写入激活码（会先本地校验） */
-  function saveLicense(code, done) {
-    const val = String(code || '').trim().toUpperCase();
-    if (!val) { if (done) done({ ok: false, reason: '请输入激活码' }); return; }
-    const r = BRH_LIC.checkCode(val);
-    if (!r.ok) { if (done) done(r); return; }
-    onlineVerify(val, (res) => {
-      if (res && res.ok === false) { if (done) done({ ok: false, reason: res.msg || '授权服务器拒绝了该激活码' }); return; }
-      setStore(STORE_KEYS.license, val);
-      setStore('brh_lic_exp', r.exp || 0);
-      setStore('brh_lic_time', Date.now());
-      if (done) done({ ok: true, expText: r.expText, warn: res && res.warn });
+  /** 校验并保存激活凭证（异步：ECDSA 验签 → 设备绑定 → 功能档位 → 服务端二次校验） */
+  function saveLicense(input, done) {
+    const val = String(input || '').trim();
+    if (!val) { if (done) done({ ok: false, reason: '请粘贴作者发给你的激活凭证（以 BRHT1. 开头）' }); return; }
+    // 旧版短码：明确告知已停用，引导换发（旧码本身没有设备绑定，一转多卖即失效机制失效）
+    if (/^BRH-/i.test(val) && val.indexOf('BRHT1.') !== 0) {
+      if (done) done({ ok: false, oldCode: true,
+        reason: '这是旧版激活码，现已升级为「激活凭证 + 设备绑定」。请把你的设备指纹 ' + deviceTag() + ' 发给作者换发新凭证。' });
+      return;
+    }
+    BRH_VERIFY.verifyToken(val).then((r) => {
+      if (!r.ok) { if (done) done({ ok: false, reason: r.reason || '凭证无效' }); return; }
+      const feats = r.info.features || ['all'];
+      onlineVerify(val, (res) => {
+        if (res && res.ok === false) { if (done) done({ ok: false, reason: res.msg || '授权服务器拒绝了该凭证（可能已被吊销）' }); return; }
+        setStore(STORE_KEYS.license, val);
+        setStore('brh_lic_exp', r.info.exp || 0);
+        setStore('brh_lic_feat', feats.join(','));
+        setStore('brh_lic_time', Date.now());
+        LIC_CACHE = { checked: true, ok: true, features: feats, exp: r.info.exp, expText: r.info.expText, note: r.info.note || '', reason: '' };
+        if (done) done({ ok: true, expText: r.info.expText, featureText: BRH_VERIFY.featureText(feats), warn: res && res.warn });
+      });
     });
   }
 
-  /** 激活弹窗 */
+  /** 清除本地授权（换绑 / 出售设备前使用） */
+  function clearLicense() {
+    setStore(STORE_KEYS.license, '');
+    setStore('brh_lic_exp', 0);
+    setStore('brh_lic_feat', '');
+    LIC_CACHE = { checked: true, ok: false, features: [], reason: '' };
+  }
+
+  /** 激活弹窗（付费功能未解锁时弹出） */
   function showLicenseModal(featureKey, onOk) {
     document.querySelectorAll('#brh-lic-mask').forEach((n) => n.remove());
     const feat = GUARD_FEATURES[featureKey] || '该功能';
+    const s = licState();
+    const tip = s.ok
+      ? ('当前授权档位未包含「<b>' + esc(feat) + '</b>」。如需解锁，请联系作者升级授权（设备指纹 ' + deviceTag() + '）。')
+      : ('「<b>' + esc(feat) + '</b>」是授权版专属功能。购买后把下方设备指纹发给作者，收到 BRHT1. 开头的激活凭证后粘贴到这里即可。');
     const mask = document.createElement('div');
     mask.id = 'brh-lic-mask';
     mask.innerHTML = `
-      <div id="brh-lic-box" style="background:#fff;border-radius:14px;max-width:420px;width:100%;padding:20px 18px;
+      <div id="brh-lic-box" style="background:#fff;border-radius:14px;max-width:460px;width:100%;padding:20px 18px;
            box-shadow:0 20px 60px rgba(0,0,0,.28);font:14px/1.65 -apple-system,'Microsoft YaHei',sans-serif;color:#0f172a">
-        <div style="font-size:16px;font-weight:700;margin-bottom:6px">🔒 需要激活</div>
-        <div style="color:#475569;margin-bottom:12px">「<b>${feat}</b>」是授权版专属功能，输入激活码后即可解锁全部能力。</div>
-        <input id="brh-lic-input" placeholder="BRH-XXXX-XXXX-XXXX" spellcheck="false"
-               style="width:100%;box-sizing:border-box;height:38px;padding:0 10px;border:1px solid #cbd5e1;border-radius:8px;
-                      font-size:14px;letter-spacing:1px;outline:none">
+        <div style="font-size:16px;font-weight:700;margin-bottom:6px">🔒 需要授权</div>
+        <div style="color:#475569;margin-bottom:10px">${tip}</div>
+        <div style="background:#f1f5f9;border-radius:8px;padding:8px 10px;font-size:12px;color:#475569;margin-bottom:10px">
+          本机设备指纹：<b style="user-select:all;letter-spacing:1px">${deviceTag()}</b>
+          <button id="brh-lic-copydev" style="float:right;border:0;background:#e2e8f0;border-radius:6px;padding:2px 8px;cursor:pointer;font-size:12px">复制</button>
+        </div>
+        <textarea id="brh-lic-input" placeholder="粘贴激活凭证：BRHT1.xxxx.xxxx（完整复制，较长）" spellcheck="false"
+               style="width:100%;box-sizing:border-box;height:84px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;
+                      font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace;resize:vertical;outline:none"></textarea>
         <div id="brh-lic-st" style="min-height:18px;font-size:12px;color:#dc2626;margin-top:6px"></div>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button id="brh-lic-ok" style="flex:1;height:36px;border:0;border-radius:8px;background:#2563eb;color:#fff;
                   font-size:14px;font-weight:600;cursor:pointer">立即激活</button>
           <button id="brh-lic-buy" style="height:36px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;
-                  background:#fff;color:#334155;font-size:13px;cursor:pointer">获取激活码</button>
+                  background:#fff;color:#334155;font-size:13px;cursor:pointer">获取授权</button>
           <button id="brh-lic-x" style="height:36px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;
                   background:#fff;color:#94a3b8;font-size:13px;cursor:pointer">取消</button>
         </div>
-        <div style="margin-top:10px;font-size:12px;color:#94a3b8">机器码 <b>${machineId()}</b>（按设备发码时请把它发给作者）</div>
+        <div style="margin-top:10px;font-size:12px;color:#94a3b8">凭证与设备一一绑定，转发给别人也无法激活；凭证请妥善保存，泄露可联系作者吊销重发。</div>
       </div>`;
     mask.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px';
     document.body.appendChild(mask);
@@ -1770,10 +2287,13 @@
     const close = () => mask.remove();
     mask.querySelector('#brh-lic-x').onclick = close;
     mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
+    mask.querySelector('#brh-lic-copydev').onclick = () => {
+      try { navigator.clipboard.writeText(deviceTag()); st.style.color = '#16a34a'; st.textContent = '设备指纹已复制，发给作者即可换发 / 续期'; } catch (e) {}
+    };
     mask.querySelector('#brh-lic-buy').onclick = () => window.open(LICENSE_PAGE, '_blank');
     const submit = () => {
       st.style.color = '#64748b';
-      st.textContent = '校验中…';
+      st.textContent = '验签中…';
       saveLicense(input.value, (r) => {
         if (!r || !r.ok) { st.style.color = '#dc2626'; st.textContent = '❌ ' + ((r && r.reason) || '激活失败'); return; }
         close();
@@ -1782,16 +2302,88 @@
       });
     };
     mask.querySelector('#brh-lic-ok').onclick = submit;
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } });
   }
 
-  /** 付费功能守门：已激活直接执行，否则弹激活框（成功后自动继续） */
+  /** 付费功能守门：已激活且档位包含该功能 → 直接执行；否则弹激活框（成功后自动继续） */
   function requirePro(featureKey, run) {
-    if (isPro()) { run(); return; }
+    if (isPro(featureKey)) { run(); return; }
     showLicenseModal(featureKey, run);
   }
 
-  /** 设置页授权卡片 */
+  /** 🔑 激活授权页（独立页签：状态 / 凭证激活 / 设备指纹 / 功能清单） */
+  function licenseTabHTML() {
+    const s = licState();
+    const feats = GUARD_FEATURES;
+    const featList = Object.keys(feats).map((k) => {
+      const has = BRH_VERIFY.hasFeature(s.features, k);
+      return `<span class="brh-chip" style="${has ? 'background:#f0fdf4;color:#15803d' : 'background:#f1f5f9;color:#94a3b8'}">${has ? '✅' : '🔒'} ${esc(feats[k])}</span>`;
+    }).join(' ');
+    const statusColor = s.ok ? '#16a34a' : '#dc2626';
+    return `
+        <div class="brh-row" style="border:1px solid ${s.ok ? '#bbf7d0' : '#fecaca'};background:${s.ok ? '#f0fdf4' : '#fef2f2'};border-radius:10px;padding:10px">
+          <div style="font-weight:700;color:${statusColor};font-size:14px">${s.ok ? '✅' : '🔒'} ${esc(s.text)}</div>
+          <div class="brh-tip" style="margin-top:3px">${esc(s.sub || '')}</div>
+          ${s.ok ? `<div class="brh-tip" style="margin-top:3px">已绑定设备指纹：<span class="brh-chip">${deviceTag()}</span>（换机请把新指纹发给作者换绑）</div>` : ''}
+        </div>
+        <div class="brh-row"><label class="brh-label">功能权限（按购买档位开放）</label><div class="brh-row">${featList}</div></div>
+        <div class="brh-row">
+          <label class="brh-label">激活凭证</label>
+          <textarea class="brh-area" id="brh-lic-token" style="min-height:84px;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace"
+            placeholder="粘贴作者发给你的激活凭证：BRHT1.xxxx.xxxx（完整复制）">${esc(s.ok || s.code ? s.code : '')}</textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn green sm" id="brh-lic-act">🔑 激活</button>
+            <button class="brh-btn ghost sm" id="brh-lic-buy2">🛒 获取授权</button>
+            ${s.ok ? '<button class="brh-btn warn sm" id="brh-lic-clear">🗑 清除本机授权</button>' : ''}
+          </div>
+          <div class="brh-status" id="brh-lic-status"></div>
+        </div>
+        <div class="brh-row">
+          <label class="brh-label">本机设备指纹（发给作者用于签发 / 换绑）</label>
+          <div class="brh-row">
+            <span class="brh-chip" style="user-select:all;letter-spacing:1px;font-size:14px">${deviceTag()}</span>
+            <button class="brh-btn ghost sm" id="brh-lic-copydev">📋 复制指纹</button>
+            <button class="brh-btn ghost sm" id="brh-lic-openpage">🌐 打开激活中心</button>
+          </div>
+        </div>
+        <div class="brh-tip">激活流程：① 购买 → ② 把设备指纹发给作者 → ③ 收到 BRHT1. 凭证粘贴到上面激活。<br>
+        防倒卖：凭证与设备指纹一一绑定，转发无效；激活后导出的 PDF / 图片带溯源水印；凭证泄露可联系作者吊销重发。</div>`;
+  }
+
+  /** 🔑 页签事件绑定（rerender：重新渲染该页签，一般传 () => UI.switchTab('license')） */
+  function bindLicenseTab(rerender) {
+    const st = $('#brh-lic-status');
+    const show = (msg, type) => { if (st) { st.textContent = msg; st.className = 'brh-status' + (type ? ' ' + type : ''); } };
+    const act = $('#brh-lic-act');
+    if (act) act.onclick = () => {
+      const v = $('#brh-lic-token').value.trim();
+      if (!v) { show('请先粘贴激活凭证', 'err'); return; }
+      show('验签中…');
+      saveLicense(v, (r) => {
+        if (!r || !r.ok) { show('❌ ' + ((r && r.reason) || '激活失败'), 'err'); return; }
+        show('✅ 激活成功' + (r.expText ? '（' + r.expText + '）' : '') + ' · ' + (r.featureText || ''), 'ok');
+        toast('✅ 激活成功', 'ok');
+        if (rerender) rerender();
+      });
+    };
+    const buy2 = $('#brh-lic-buy2');
+    if (buy2) buy2.onclick = () => window.open(LICENSE_PAGE, '_blank');
+    const clearBtn = $('#brh-lic-clear');
+    if (clearBtn) clearBtn.onclick = () => {
+      if (!confirm('确定清除本机授权？清除后付费功能将重新锁定（凭证本身仍有效，可重新粘贴激活）。')) return;
+      clearLicense(); show('已清除本机授权', 'ok'); if (rerender) rerender();
+    };
+    const cd = $('#brh-lic-copydev');
+    if (cd) cd.onclick = () => {
+      const done = () => { toast('设备指纹已复制', 'ok'); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(deviceTag()).then(done, done);
+      else done();
+    };
+    const op = $('#brh-lic-openpage');
+    if (op) op.onclick = () => window.open(LICENSE_PAGE, '_blank');
+  }
+
+  /** 设置页顶部授权状态摘要（详细操作在 🔑 激活授权页） */
   function licenseCardHTML(tpl) {
     const s = licState();
     const statusColor = s.ok ? '#16a34a' : '#dc2626';
@@ -1799,16 +2391,10 @@
         <div class="brh-row" style="border:1px solid ${s.ok ? '#bbf7d0' : '#fecaca'};background:${s.ok ? '#f0fdf4' : '#fef2f2'};border-radius:10px;padding:10px">
           <div style="font-weight:700;color:${statusColor};font-size:14px">${s.ok ? '✅ ' : '🔒 '}${esc(s.text)}</div>
           <div class="brh-tip" style="margin-top:3px">${esc(s.sub || '全部功能已解锁')}</div>
-        </div>
-        <div class="brh-row">
-          <label class="brh-label">激活码</label>
-          <input class="brh-input" id="brh-cfg-license" value="${esc(s.code)}" placeholder="BRH-XXXX-XXXX-XXXX" spellcheck="false">
           <div class="brh-row" style="margin-top:6px">
-            <button class="brh-btn green sm" id="brh-lic-act">🔑 激活</button>
-            <button class="brh-btn ghost sm" id="brh-lic-buy2">🛒 获取激活码</button>
+            <button class="brh-btn ghost sm" id="brh-lic-goto">🔑 前往「激活授权」页管理</button>
+            <button class="brh-btn ghost sm" id="brh-tpl-manage" style="margin:0">🗣 话术模板管理</button>
           </div>
-          <div class="brh-tip" style="margin-top:6px">机器码 <span class="brh-chip">${machineId()}</span> · 未激活时：AI 优化 / 选岗扫描 / 话术生成 / 简历图片发送与导出 均不可用。</div>
-          <div class="brh-tip" style="margin-top:3px">当前模板：<span class="brh-chip">${esc(tpl.name)}</span> · <button class="brh-btn ghost sm" id="brh-tpl-manage" style="margin:0">🗣 话术模板管理</button></div>
         </div>`;
   }
 
@@ -1847,7 +2433,10 @@
   }
 
   function verifyLicense(code) {
-    return !!String(code || '').trim() && BRH_LIC.checkCode(code).ok;
+    // 售卖版：凭证格式同步预检（完整验签在 refreshLicense / saveLicense 中异步完成）
+    const v = String(code || '').trim();
+    if (!v) return false;
+    return BRH_VERIFY.parseTokenInfo(v).kind === 'token';
   }
 
   /* ============================================================
@@ -1857,10 +2446,11 @@
   function boot() {
     if (window.top !== window.self) return; // 只在顶层页面运行
     UI.init();
-    // 授权状态提示（付费功能在各自入口拦截）
-    const lic = getStore(STORE_KEYS.license, '').trim();
-    if (!lic) toast('🔒 未激活：AI 优化 / 选岗 / 话术 / 发送简历 需要激活码', 'info');
-    else if (!verifyLicense(lic)) toast('⚠️ 激活码无效或已过期，请到「⚙️ 设置」重新激活', 'err');
+    // 授权校验（付费功能在各自入口拦截；🔑 激活授权页可查看状态与权限）
+    refreshLicense().then((s) => {
+      if (!s.ok) toast('🔒 未激活：AI 优化 / 选岗 / 话术 / 导出 / 发送简历 需要授权（见 🔑 激活授权页）', 'info');
+      else toast('✅ 授权有效 · ' + (BRH_VERIFY.featureText(s.features) || ''), 'ok');
+    });
     // 启动 24 小时后台静默检查更新（不弹窗）
     const lastCheck = getStore('brh_last_update_check', 0);
     if (Date.now() - lastCheck > 24 * 3600 * 1000) { setStore('brh_last_update_check', Date.now()); checkUpdate(true); }

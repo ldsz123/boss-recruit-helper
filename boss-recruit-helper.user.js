@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.3.0
-// @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并下载/投递
+// @version      1.6.0
+// @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
 // @match        https://zhipin.com/*
@@ -10,6 +10,7 @@
 // @require      https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
+// 注：导出优先用预载的 html2canvas + jsPDF 生成真实 PDF/图片文件；CDN 不可用时自动降级为 SVG 渲染 + 浏览器打印
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
@@ -37,11 +38,13 @@
     resume: 'brh_resume',    // 用户原始简历文本
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
+    hrQuestion: 'brh_hr_question', // 最近一次 HR 提问（智能回复用）
+    hrReply: 'brh_hr_reply',    // 最近一次生成的 HR 回复
     greetingTpl: 'brh_greeting_tpl',        // 当前选中的话术模板 id
     greetingTemplates: 'brh_greeting_templates', // 自定义话术模板数组（覆盖默认）
     matchRes: 'brh_match_res',  // 最近一次岗位匹配结果（数组）
     license: 'brh_license',     // 授权码（可选，售卖时启用）
-    resumeTheme: 'brh_resume_theme', // 简历版式：modern（现代简约）/ business（深色商务）
+    resumeTheme: 'brh_resume_theme', // 简历版式：modern / business / elegant
     updateUrl: 'brh_update_url'      // 用户自定义的云端更新地址（覆盖默认）
   };
 
@@ -49,12 +52,12 @@
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: '',
     model: 'deepseek-chat',
-    resumeTheme: 'modern',  // modern | business
+    resumeTheme: 'modern',  // modern | business | elegant
     updateUrl: ''           // 留空则使用脚本内置的默认托管地址
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.3.0';
+  const VERSION = '1.6.0';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -623,6 +626,73 @@
     }, opts.silent ? 'brh-optimize' : 'brh-chat');
   }
 
+  /* ---- HR 智能回复：抓取 HR 最新提问 → 结合优化简历与 JD 生成针对性回复 ---- */
+
+  // 从聊天窗口抓取 HR 的最新消息（Boss 消息 DOM 无稳定 class，做多选择器 + 关键词兜底）
+  function extractHrQuestion() {
+    const candidates = [
+      '.im-list .im-item .im-msg-left',
+      '.im-item .msg-left',
+      '.chat-message .msg-left',
+      '.message-list .left',
+      '[class*="msg-left"]',
+      '[class*="im-msg-left"]'
+    ];
+    let best = '';
+    for (const sel of candidates) {
+      $$(sel).forEach((el) => {
+        const t = txt(el);
+        // 只要像「提问」的气泡：含问号/疑问词，或明显长于寒暄
+        if (t && t.length > 4 && t.length < 500 && /[?？]|请教|了解|方便|期望|考虑|为什么|多久|薪资|经验|介绍|到岗|住址|离职|加班/.test(t)) {
+          if (t.length >= best.length) best = t;
+        }
+      });
+      if (best) break;
+    }
+    return best;
+  }
+
+  function generateHrReply(opts = {}) {
+    const optimized = getStore(STORE_KEYS.optimized, '');
+    if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
+    const jd = getStore(STORE_KEYS.jd, '');
+    const manual = opts.manual || '';
+    let question = manual || extractHrQuestion();
+    if (!question) {
+      // 页面上抓不到 → 让用户手动粘贴 HR 的问题
+      const v = prompt('未在当前页面识别到 HR 的新提问。\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
+      if (!v || !v.trim()) return;
+      question = v.trim();
+    }
+    setStore(STORE_KEYS.hrQuestion, question);
+    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在结合优化后的简历生成针对性回复…');
+
+    const sys = [
+      '你是一位帮助求职者与 HR 沟通的顾问。根据 HR 的最新提问，用候选人的第一人称写一条 Boss 直聘回复。',
+      '严格遵守：',
+      '1. 只使用【优化后简历】里真实存在的经历与数据，严禁编造；',
+      '2. 只回答 HR 问到的点（可顺带 1 句优势补充），不要泛泛自我介绍；',
+      '3. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '4. 如果 HR 的问题涉及简历未覆盖的信息（如到岗时间、期望薪资），给出得体的通用答法并提醒用户按实际情况确认；',
+      '5. 只输出回复正文，不要引号、前缀和解释。'
+    ].join('\n');
+    const messages = [
+      { role: 'system', content: sys },
+      { role: 'user', content: [
+        jd ? `【目标岗位 JD】\n${jd.slice(0, 2000)}` : '',
+        `【优化后简历】\n${optimized.slice(0, 6000)}`,
+        `【HR 的最新提问】\n${question}`
+      ].filter(Boolean).join('\n\n') }
+    ];
+
+    callLLM(messages, (content) => {
+      setStore(STORE_KEYS.hrReply, content);
+      UI.renderHrReply(content, question);
+      UI.showStatus('brh-chat', '✅ 回复已生成，检查后可填入聊天框', 'ok');
+      if (!opts.silent) toast('针对 HR 提问的回复已生成', 'ok');
+    }, 'brh-chat');
+  }
+
   /* ============================================================
    * 4. 导出下载（.doc / .md）
    * ========================================================== */
@@ -692,8 +762,12 @@
    * ========================================================== */
 
   const RESUME_THEMES = {
-    modern: { name: '现代简约', accent: '#00a1ea' },
-    business: { name: '深色商务', accent: '#1e3a5f' }
+    modern:   { name: '现代简约', accent: '#0ea5e9', soft: '#e8f6fe', layout: 'modern' },
+    business: { name: '深色商务', accent: '#1e3a5f', soft: '#eef2f7', layout: 'business' },
+    elegant:  { name: '雅致衬线', accent: '#8a5a3b', soft: '#f7f0ea', layout: 'elegant' },
+    ocean:    { name: '深海渐变', accent: '#2563eb', soft: '#dbeafe', layout: 'ocean' },
+    vitality: { name: '活力橙红', accent: '#ea580c', soft: '#ffedd5', layout: 'vitality' },
+    jade:     { name: '青玉留白', accent: '#0f766e', soft: '#ccfbf1', layout: 'jade' }
   };
 
   function getResumeTheme() {
@@ -738,104 +812,349 @@
     return data;
   }
 
-  // 生成好看的简历 HTML（A4 宽度 794px ≈ 210mm @96dpi）
-  function buildResumeHTML(md, theme) {
+  // 从正文里提取联系方式，避免在页眉和正文中重复展示
+  function extractContacts(md) {
+    const text = String(md || '');
+    return {
+      phone: (text.match(/1[3-9]\d{9}/) || [])[0] || '',
+      email: (text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/) || [])[0] || ''
+    };
+  }
+
+  // 技能/证书类分区用标签云展示，更像真实简历
+  const CHIP_TITLE_RE = /(技能|专长|能力|证书|标签|工具|语言|Skills?)/i;
+
+  // 生成简历 HTML（A4 宽度 794px ≈ 210mm @96dpi；打印时用 CSS 换算成 mm）
+  // opts.watermark：溯源水印文本（售卖版激活后自动带授权标识，防止截图/转卖后无法追责）
+  function buildResumeHTML(md, theme, opts) {
     const d = parseResumeMarkdown(md);
     const meta = getStore(STORE_KEYS.jdMeta, {});
-    const accent = RESUME_THEMES[theme] ? RESUME_THEMES[theme].accent : '#00a1ea';
-    const name = d.name || '个人简历';
-    const head = d.headline ||
-      (meta.title ? `求职意向：${meta.title}${meta.salary ? '　·　' + meta.salary : ''}` : '');
+    const th = RESUME_THEMES[theme] ? RESUME_THEMES[theme] : RESUME_THEMES.modern;
+    const accent = th.accent;
+    const soft = th.soft || '#eef6fc';
+    const wm = (opts && opts.watermark) ? String(opts.watermark) : '';
+    const ct = extractContacts(md);
     const today = nowStr().slice(0, 10);
 
+    // 姓名行常写成「张三 — 应聘岗位」，拆开更美观
+    let name = d.name || '个人简历';
+    let head = d.headline || '';
+    const nmSplit = name.match(/^(.{2,8}?)\s*[—–\-|｜·]\s*(.+)$/);
+    if (nmSplit) { name = nmSplit[1].trim(); if (!head) head = nmSplit[2].trim(); }
+
+    // 页眉已单独展示联系方式，正文里同款信息去掉，避免重复
+    const cleanBit = (s) => {
+      let t = String(s || '')
+        .split(ct.phone).join('').split(ct.email).join('')
+        .replace(/\*\*|__|`/g, '')
+        .replace(/电\s*话\s*[:：]?/g, '').replace(/邮\s*箱\s*[:：]?/g, '');
+      t = t.replace(/[\s|｜·、,，/]*[|｜][\s|｜·、,，/]*/g, ' | ');   // 分隔符规整
+      return t.replace(/\s{2,}/g, ' ')
+        .replace(/^[\s|｜·、,，/]+|[\s|｜·、,，/]+$/g, '')
+        .trim();
+    };
+    head = cleanBit(head);
+    if (!head) head = meta.title ? `求职意向：${meta.title}${meta.salary ? '　·　' + meta.salary : ''}` : '';
+
+    const contactBits = [ct.phone, ct.email].filter(Boolean);
+    const contactHtml = contactBits.length
+      ? `<div class="rs-contact">${contactBits.map((b) => `<span>${inlineMd(b)}</span>`).join('')}</div>`
+      : '';
+
+    // 正文里若已出现联系方式，就不再重复渲染该行
+    const dropContact = (t) => {
+      if (!t) return false;
+      if (ct.phone && t.indexOf(ct.phone) >= 0) return true;
+      if (ct.email && t.indexOf(ct.email) >= 0) return true;
+      return false;
+    };
+
     const sectionsHtml = d.sections.map((s) => {
+      const isChip = CHIP_TITLE_RE.test(s.title || '');
       let inner = '';
-      (s.paras || []).forEach((p) => { inner += `<div class="rs-p">${inlineMd(p)}</div>`; });
-      (s.items || []).forEach((it) => {
-        inner += it.sub
-          ? `<div class="rs-sub">${inlineMd(it.sub)}</div>`
-          : `<div class="rs-li"><span class="rs-dot"></span><div>${inlineMd(it.text)}</div></div>`;
+      (s.paras || []).forEach((p) => {
+        if (dropContact(p)) return;
+        inner += `<div class="rs-p">${inlineMd(p)}</div>`;
       });
-      const titleHtml = s.title ? `<div class="rs-sec-t">${inlineMd(s.title)}</div>` : '';
-      return `<div class="rs-sec">${titleHtml}${inner}</div>`;
+      (s.items || []).forEach((it) => {
+        if (dropContact(it.text || it.sub || '')) return;
+        if (it.sub) { inner += `<div class="rs-sub">${inlineMd(it.sub)}</div>`; return; }
+        if (isChip) { inner += `<span class="rs-chip">${inlineMd(it.text)}</span>`; return; }
+        inner += `<div class="rs-li"><i class="rs-dot"></i><div>${inlineMd(it.text)}</div></div>`;
+      });
+      if (!inner) return '';
+      const titleHtml = s.title
+        ? `<div class="rs-sec-t"><span class="rs-bar"></span><span class="rs-sec-txt">${inlineMd(s.title)}</span><span class="rs-sec-line"></span></div>`
+        : '';
+      return `<div class="rs-sec">${titleHtml}${isChip ? `<div class="rs-chips">${inner}</div>` : inner}</div>`;
     }).join('');
 
-    const foot = `<div class="rs-foot">由 Boss招聘小助手 生成 · ${today}${meta.company ? ' · 投递：' + inlineMd(meta.company) : ''}</div>`;
+    const wmTag = wm ? `<span class="rs-foot-lic">${esc(wm)}</span>` : '';
+    const foot = `<div class="rs-foot"><span>Boss招聘小助手 · 定制优化</span><span>${today}${meta.company ? ' · 投递 ' + inlineMd(meta.company) : ''}</span>${wmTag}</div>`;
+    const wmHtml = wm
+      ? `<div class="rs-wm" aria-hidden="true"><span>${esc(wm)}</span><span>${esc(wm)}</span><span>${esc(wm)}</span></div>`
+      : '';
 
     const style = `
-      .rs-wrap{ width:794px; background:#fff; font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB',sans-serif; color:#222; box-sizing:border-box; }
+      .rs-wrap{ width:794px; background:#fff; color:#262626; box-sizing:border-box; position:relative; overflow:hidden;
+                font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Source Han Sans SC',sans-serif; }
       .rs-wrap *{ box-sizing:border-box; }
-      .rs-sec{ margin-bottom:14px; }
-      .rs-sec-t{ font-size:15px; font-weight:700; color:${accent}; padding:4px 0 5px 10px; border-left:4px solid ${accent}; margin-bottom:8px; letter-spacing:.5px; }
-      .rs-sub{ font-size:13px; font-weight:700; color:#333; margin:9px 0 4px; }
-      .rs-p{ font-size:12.5px; line-height:1.75; margin:3px 0; color:#333; }
-      .rs-li{ display:flex; align-items:flex-start; font-size:12.5px; line-height:1.75; margin:3px 0; color:#333; }
-      .rs-dot{ flex:0 0 auto; width:5px; height:5px; background:${accent}; border-radius:50%; margin:9px 8px 0 2px; }
+      .rs-wm{ position:absolute; left:0; top:0; right:0; bottom:0; z-index:9; pointer-events:none;
+              display:flex; flex-direction:column; justify-content:space-evenly; align-items:center;
+              transform:rotate(-24deg); }
+      .rs-wm span{ font-size:24px; font-weight:700; color:rgba(100,116,139,.06); letter-spacing:4px; white-space:nowrap; }
+      .rs-foot-lic{ color:#b91c1c; opacity:.72; }
+      .rs-sec{ margin-bottom:15px; }
+      .rs-sec-t{ display:flex; align-items:center; margin-bottom:9px; }
+      .rs-bar{ width:4px; height:15px; background:${accent}; border-radius:2px; margin-right:8px; }
+      .rs-sec-txt{ font-size:15px; font-weight:700; color:${accent}; letter-spacing:1px; white-space:nowrap; }
+      .rs-sec-line{ flex:1; height:1px; margin-left:10px;
+                    background:linear-gradient(to right,${accent},rgba(255,255,255,0)); opacity:.5; }
+      .rs-sub{ font-size:13px; font-weight:700; color:#1f2937; margin:11px 0 5px; padding-left:9px;
+               border-left:3px solid ${accent}; }
+      .rs-p{ font-size:12.5px; line-height:1.85; margin:3px 0; color:#374151; }
+      .rs-li{ display:flex; align-items:flex-start; font-size:12.5px; line-height:1.85; margin:4px 0; color:#374151; }
+      .rs-dot{ flex:0 0 auto; width:5px; height:5px; background:${accent}; border-radius:1px;
+               margin:9px 9px 0 3px; transform:rotate(45deg); }
       .rs-li>div{ flex:1; }
-      .rs-foot{ font-size:10.5px; color:#aaa; text-align:center; margin-top:16px; padding-top:8px; border-top:1px dashed #e3e3e3; }
-      .rs-modern{ padding:34px 46px 26px; }
-      .rs-modern .rs-top{ border-bottom:3px solid ${accent}; padding-bottom:12px; margin-bottom:16px; }
-      .rs-modern .rs-name{ font-size:29px; font-weight:700; color:#1a1a1a; letter-spacing:2px; }
-      .rs-modern .rs-head{ font-size:13px; color:#666; margin-top:7px; }
+      .rs-chips{ display:flex; flex-wrap:wrap; gap:7px; }
+      .rs-chip{ display:inline-block; font-size:12px; line-height:1.6; padding:3px 11px; border-radius:11px;
+                background:${soft}; color:#1f2937; border:1px solid ${accent}33; }
+      .rs-foot{ display:flex; justify-content:space-between; font-size:10.5px; color:#9ca3af;
+                margin-top:18px; padding-top:9px; border-top:1px dashed #e5e7eb; }
+      .rs-contact{ display:flex; gap:16px; font-size:12px; color:#4b5563; }
+      .rs-contact span{ display:inline-flex; align-items:center; }
+      .rs-contact span::before{ content:''; width:4px; height:4px; border-radius:50%;
+                                background:${accent}; margin-right:6px; }
+
+      /* ---------- 版式一：现代简约 ---------- */
+      .rs-modern{ padding:40px 48px 30px; }
+      .rs-modern .rs-top{ display:flex; align-items:flex-end; justify-content:space-between;
+                          padding-bottom:16px; margin-bottom:20px; border-bottom:3px solid ${accent}; }
+      .rs-modern .rs-name{ font-size:31px; font-weight:700; color:#111827; letter-spacing:4px; line-height:1.2; }
+      .rs-modern .rs-head{ font-size:13.5px; color:${accent}; margin-top:9px; font-weight:600; letter-spacing:.5px; }
+
+      /* ---------- 版式二：深色商务（左右分栏） ---------- */
       .rs-business{ display:flex; min-height:1123px; }
-      .rs-business .rs-side{ width:236px; flex:0 0 236px; background:${accent}; color:#fff; padding:34px 26px; }
-      .rs-business .rs-side .rs-name{ font-size:26px; font-weight:700; letter-spacing:2px; line-height:1.3; }
-      .rs-business .rs-side .rs-line{ width:38px; height:3px; background:#fff; opacity:.85; margin:14px 0; }
-      .rs-business .rs-side .rs-head{ font-size:12.5px; line-height:1.8; opacity:.92; }
-      .rs-business .rs-side .rs-tag{ margin-top:18px; font-size:11px; opacity:.75; line-height:1.7; }
-      .rs-business .rs-main{ flex:1; padding:34px 38px 26px; background:#fff; }
+      .rs-business .rs-side{ width:240px; flex:0 0 240px; background:${accent}; color:#fff; padding:40px 26px; }
+      .rs-business .rs-side .rs-name{ font-size:27px; font-weight:700; letter-spacing:3px; line-height:1.35; }
+      .rs-business .rs-side .rs-line{ width:40px; height:3px; background:#fff; opacity:.9; margin:16px 0 14px; }
+      .rs-business .rs-side .rs-head{ font-size:12.5px; line-height:1.9; opacity:.95; }
+      .rs-business .rs-side .rs-contact{ margin-top:14px; color:#fff; opacity:.9; font-size:11.5px; flex-direction:column; gap:5px; }
+      .rs-business .rs-side .rs-contact span::before{ background:#fff; }
+      .rs-business .rs-side .rs-tag{ margin-top:24px; font-size:11px; opacity:.72; line-height:1.8;
+                                     border-top:1px solid rgba(255,255,255,.28); padding-top:12px; }
+      .rs-business .rs-main{ flex:1; padding:40px 40px 30px; background:#fff; }
+      .rs-business .rs-sec-txt{ color:${accent}; }
+
+      /* ---------- 版式三：雅致衬线 ---------- */
+      .rs-elegant{ padding:44px 52px 30px; font-family:Georgia,'Songti SC','SimSun','Microsoft YaHei',serif; }
+      .rs-elegant .rs-top{ text-align:center; padding-bottom:18px; margin-bottom:22px;
+                           border-bottom:1px solid ${accent}; position:relative; }
+      .rs-elegant .rs-top::after{ content:''; position:absolute; left:50%; bottom:-4px; width:56px; height:7px;
+                                  margin-left:-28px; background:#fff; border-left:1px solid ${accent};
+                                  border-right:1px solid ${accent}; }
+      .rs-elegant .rs-name{ font-size:30px; font-weight:700; color:${accent}; letter-spacing:6px; }
+      .rs-elegant .rs-head{ font-size:13px; color:#6b7280; margin-top:10px; letter-spacing:1px; }
+      .rs-elegant .rs-contact{ justify-content:center; margin-top:8px; }
+      .rs-elegant .rs-sec-txt{ color:${accent}; font-weight:600; }
+      .rs-elegant .rs-bar{ background:${accent}; }
+
+      /* ---------- 版式四：深海渐变（渐变横幅头部） ---------- */
+      .rs-ocean{ padding:0 48px 30px; }
+      .rs-ocean .rs-top{ margin:0 -48px 24px; padding:34px 48px 26px; color:#fff;
+                         background:linear-gradient(120deg,${accent} 0%,${accent}dd 55%,#7c3aed 130%);
+                         display:flex; align-items:flex-end; justify-content:space-between; }
+      .rs-ocean .rs-name{ font-size:31px; font-weight:700; letter-spacing:5px; color:#fff; }
+      .rs-ocean .rs-head{ font-size:13px; margin-top:9px; color:#fff; opacity:.92; letter-spacing:.5px; }
+      .rs-ocean .rs-contact{ color:rgba(255,255,255,.92); font-size:11.5px; gap:14px; }
+      .rs-ocean .rs-contact span::before{ background:#fff; }
+      .rs-ocean .rs-sec-t{ border:0; }
+      .rs-ocean .rs-sec-txt{ color:${accent}; }
+      .rs-ocean .rs-sec-line{ background:linear-gradient(to right,${accent},rgba(255,255,255,0)); }
+      .rs-ocean .rs-sec:first-of-type{ margin-top:-6px; }
+
+      /* ---------- 版式五：活力橙红（时间线） ---------- */
+      .rs-vitality{ padding:40px 48px 30px; }
+      .rs-vitality .rs-top{ display:flex; align-items:flex-end; gap:14px; margin-bottom:22px; }
+      .rs-vitality .rs-name{ font-size:30px; font-weight:800; color:#1c1917; letter-spacing:3px; }
+      .rs-vitality .rs-top .rs-head{ font-size:13px; color:#fff; background:${accent}; padding:4px 12px;
+                                     border-radius:14px; margin-bottom:6px; font-weight:600; }
+      .rs-vitality .rs-contact{ margin-bottom:18px; }
+      .rs-vitality .rs-sec{ position:relative; padding-left:20px; }
+      .rs-vitality .rs-sec::before{ content:''; position:absolute; left:5px; top:5px; bottom:2px; width:2px;
+                                    background:linear-gradient(${accent},${accent}22); border-radius:1px; }
+      .rs-vitality .rs-sec::after{ content:''; position:absolute; left:0; top:2px; width:12px; height:12px;
+                                   border-radius:50%; background:${accent}; border:3px solid ${soft}; }
+      .rs-vitality .rs-sec-t{ margin-bottom:8px; }
+      .rs-vitality .rs-bar{ display:none; }
+      .rs-vitality .rs-sec-txt{ color:${accent}; }
+      .rs-vitality .rs-sec-line{ display:none; }
+      .rs-vitality .rs-chip{ background:${accent}; color:#fff; border:0; border-radius:6px; font-weight:600; }
+
+      /* ---------- 版式六：青玉留白（极简双线） ---------- */
+      .rs-jade{ padding:46px 56px 30px; }
+      .rs-jade .rs-top{ text-align:center; padding-bottom:16px; margin-bottom:6px; }
+      .rs-jade .rs-name{ font-size:29px; font-weight:600; color:#134e4a; letter-spacing:10px; text-indent:10px; }
+      .rs-jade .rs-head{ font-size:12.5px; color:#6b7280; margin-top:9px; letter-spacing:2px; }
+      .rs-jade .rs-contact{ justify-content:center; margin-top:10px; }
+      .rs-jade .rs-topline{ height:3px; margin:14px 0 20px; border-top:2px solid #134e4a; border-bottom:1px solid #134e4a; }
+      .rs-jade .rs-sec-t{ margin-bottom:10px; }
+      .rs-jade .rs-bar{ width:9px; height:9px; background:${accent}; border-radius:2px; transform:rotate(45deg); margin-right:9px; }
+      .rs-jade .rs-sec-txt{ color:#134e4a; letter-spacing:3px; }
+      .rs-jade .rs-sec-line{ background:linear-gradient(to right,#99f6e4,rgba(255,255,255,0)); }
+      .rs-jade .rs-sub{ border-left-color:${accent}; }
     `;
 
+    const headBlock = head
+      ? `<div class="rs-head">${inlineMd(head)}</div>`
+      : '';
+    /* 水印层插在 .rs-wrap 内部（absolute 定位以简历纸面为参照） */
+    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}">${wmHtml}${inner}</div>`;
     const body = theme === 'business'
-      ? `<div class="rs-wrap rs-business">
+      ? withWm('rs-business', `
            <div class="rs-side">
              <div class="rs-name">${inlineMd(name)}</div>
              <div class="rs-line"></div>
              <div class="rs-head">${inlineMd(head)}</div>
-             <div class="rs-tag">Boss招聘小助手<br>定制优化简历</div>
+             ${contactHtml}
+             <div class="rs-tag">Boss招聘小助手<br/>按岗位 JD 定制优化</div>
            </div>
            <div class="rs-main">${sectionsHtml}${foot}</div>
-         </div>`
-      : `<div class="rs-wrap rs-modern">
+         `)
+      : theme === 'elegant'
+      ? withWm('rs-elegant', `
            <div class="rs-top">
              <div class="rs-name">${inlineMd(name)}</div>
-             ${head ? `<div class="rs-head">${inlineMd(head)}</div>` : ''}
+             ${headBlock}
+             ${contactHtml}
            </div>
            ${sectionsHtml}${foot}
-         </div>`;
+         `)
+      : theme === 'ocean'
+      ? withWm('rs-ocean', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'vitality'
+      ? withWm('rs-vitality', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+           </div>
+           ${contactHtml}
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'jade'
+      ? withWm('rs-jade', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+             ${contactHtml}
+           </div>
+           <div class="rs-topline"></div>
+           ${sectionsHtml}${foot}
+         `)
+      : withWm('rs-modern', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `);
 
     return `<style>${style}</style>${body}`;
   }
 
-  // 用 html2canvas 把模板渲染成画布（离屏，渲染完立即移除）
+  /* ------------------------------------------------------------------
+   * 渲染方案说明（重要）：
+   *   图片/PDF 优先用 Tampermonkey @require 预载的 html2canvas + jsPDF，
+   *   直接生成真实可下载的 .png / .pdf 文件（不依赖 SVG foreignObject，
+   *   不受目标站 CSP 对 data: 图片的限制——这正是旧版「图片无法生成」的原因）。
+   *   CDN 组件加载失败（断网等）时自动降级：
+   *     图片 → SVG foreignObject 原生渲染（零依赖）
+   *     PDF  → 打开打印窗口（矢量中文，窗口内无内联脚本，由父页面调 print，
+   *            避免 about:blank 继承 CSP 拦截内联 <script> 导致白屏）
+   * ------------------------------------------------------------------ */
+
+  // 把 DOM 节点转成 canvas（SVG foreignObject 方案，无任何外部依赖；作为兜底）
+  function nodeToCanvas(node, w, h, scale) {
+    return new Promise((resolve, reject) => {
+      let xml = '';
+      try { xml = new XMLSerializer().serializeToString(node); }
+      catch (e) { reject(new Error('HTML 序列化失败：' + e.message)); return; }
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (w * scale) + '" height="' + (h * scale) +
+        '" viewBox="0 0 ' + w + ' ' + h + '">' +
+        '<foreignObject x="0" y="0" width="100%" height="100%">' + xml + '</foreignObject></svg>';
+      const img = new Image();
+      img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(w * scale);
+        cv.height = Math.round(h * scale);
+        const ctx = cv.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        try { ctx.drawImage(img, 0, 0, cv.width, cv.height); }
+        catch (e) { reject(new Error('绘制失败：' + e.message)); return; }
+        resolve(cv);
+      };
+      img.onerror = () => reject(new Error('SVG 渲染失败（浏览器不支持或内容含非法标签）'));
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    });
+  }
+
+  // 渲染简历画布：html2canvas 优先，失败退回 SVG foreignObject
   function renderResumeCanvas(opts = {}) {
     const content = getStore(STORE_KEYS.optimized, '');
     if (!content) { toast('还没有优化简历，请先点击「开始优化」', 'err'); return Promise.reject(new Error('no-content')); }
-    if (typeof window.html2canvas !== 'function') {
-      toast('图片渲染库未加载（多为网络受限），请刷新页面重试，或改用「下载 .doc」', 'err');
-      return Promise.reject(new Error('html2canvas-missing'));
-    }
     const theme = opts.theme || getResumeTheme();
+    const scale = opts.scale || 2;
+    // 售卖版激活后会在导出物上带溯源水印（免费版无此函数，为空）
+    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const html = buildResumeHTML(content, theme, { watermark: wm });
+
+    // ① 挂到离屏容器（注意：html 第一个子元素是 <style>，真实纸面是 .rs-wrap，别量错对象）
     const host = document.createElement('div');
-    host.style.cssText = 'position:fixed;left:-10000px;top:0;z-index:-1;opacity:1;';
-    host.innerHTML = buildResumeHTML(content, theme);
+    host.style.cssText = 'position:fixed;left:-10000px;top:0;width:794px;z-index:-1;pointer-events:none;';
+    host.innerHTML = html;
     document.body.appendChild(host);
-    const target = host.firstElementChild;
-    return window.html2canvas(target, {
-      scale: 2, backgroundColor: '#ffffff', useCORS: true, logging: false, imageTimeout: 15000
-    }).then((canvas) => {
-      if (host.parentNode) host.parentNode.removeChild(host);
-      return canvas;
-    }).catch((e) => {
-      if (host.parentNode) host.parentNode.removeChild(host);
-      toast('简历渲染失败：' + ((e && e.message) || '未知错误'), 'err');
-      throw e;
-    });
+    const paper = () => host.querySelector('.rs-wrap') || host.firstElementChild;
+    const h = Math.max(paper().offsetHeight || paper().scrollHeight || 1123, 700);
+
+    const cleanup = () => { if (host.parentNode) host.parentNode.removeChild(host); };
+
+    // ② html2canvas：直接读 DOM 绘制，不经过 data: 图片，不受 CSP 影响
+    const tryH2C = () => {
+      const lib = (typeof html2canvas !== 'undefined') ? html2canvas
+        : (typeof window !== 'undefined' && window.html2canvas);
+      if (typeof lib !== 'function') return Promise.reject(new Error('html2canvas 未加载'));
+      return lib(paper(), {
+        scale, backgroundColor: '#ffffff', logging: false, useCORS: true,
+        width: 794, windowWidth: 794
+      });
+    };
+    // ③ 兜底：SVG foreignObject
+    const trySvg = () => nodeToCanvas(paper(), 794, h, scale);
+
+    return tryH2C()
+      .catch((e1) => trySvg().catch((e2) => {
+        throw new Error((e1 && e1.message ? e1.message : e1) + ' / ' + (e2 && e2.message ? e2.message : e2));
+      }))
+      .then((cv) => { cleanup(); return cv; }, (e) => { cleanup(); throw e; });
   }
 
   function canvasDownload(canvas, fileName) {
     canvas.toBlob((blob) => {
-      if (!blob) { toast('图片生成失败', 'err'); return; }
+      if (!blob) { toast('图片生成失败，请改用「下载 .doc」', 'err'); return; }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = fileName;
@@ -845,40 +1164,102 @@
     }, 'image/png');
   }
 
-  // canvas → 多页 A4 PDF
-  function canvasToPdf(canvas, fileName) {
-    const JSPDF = window.jspdf && window.jspdf.jsPDF;
-    if (!JSPDF) {
-      toast('PDF 库未加载，已改为下载图片', 'err');
-      canvasDownload(canvas, String(fileName).replace(/\.pdf$/i, '.png'));
-      return;
-    }
-    const pdf = new JSPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
-    const pageW = 210, pageH = 297;
-    const imgW = pageW;
-    const imgH = canvas.height * (pageW / canvas.width);
-    const imgData = canvas.toDataURL('image/jpeg', 0.94);
-    let heightLeft = imgH;
-    let position = 0;
-    pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
-    heightLeft -= pageH;
-    while (heightLeft > 0) {
-      position = heightLeft - imgH;
-      pdf.addPage();
-      pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
-      heightLeft -= pageH;
-    }
-    pdf.save(fileName);
+  // jsPDF（由 @require 预载）是否可用
+  function jsPDFLib() {
+    const J = (typeof jspdf !== 'undefined' && jspdf && jspdf.jsPDF) ? jspdf.jsPDF
+      : (typeof window !== 'undefined' && window.jspdf && window.jspdf.jsPDF) ? window.jspdf.jsPDF : null;
+    return J;
+  }
+
+  // 把整条长图画进 A4 竖版 PDF 并保存为真实文件（多页自动切片）
+  function buildResumePdf() {
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    const fileName = `简历-优化-${safeName(meta.title) || '岗位'}.pdf`;
+    return renderResumeCanvas({ scale: 2 }).then((canvas) => {
+      const JsPDF = jsPDFLib();
+      if (!JsPDF) throw new Error('jsPDF 未加载');
+      const PW = 210;                                    // A4 宽 mm
+      const pxPerMm = canvas.width / PW;
+      const pageHpx = Math.max(1, Math.round(297 * pxPerMm)); // 一页 A4 对应的画布像素
+      const pages = Math.max(1, Math.ceil(canvas.height / pageHpx));
+      const doc = new JsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+      const slice = document.createElement('canvas');
+      const sctx = slice.getContext('2d');
+      for (let p = 0; p < pages; p++) {
+        const sy = p * pageHpx;
+        const sh = Math.min(pageHpx, canvas.height - sy);
+        slice.width = canvas.width; slice.height = sh;
+        sctx.fillStyle = '#ffffff'; sctx.fillRect(0, 0, slice.width, slice.height);
+        sctx.drawImage(canvas, 0, sy, canvas.width, sh, 0, 0, canvas.width, sh);
+        const img = slice.toDataURL('image/jpeg', 0.95);
+        if (p > 0) doc.addPage();
+        doc.addImage(img, 'JPEG', 0, 0, PW, (sh / pxPerMm), undefined, 'FAST');
+      }
+      doc.save(fileName);
+      return fileName;
+    });
+  }
+
+  // 生成可打印的 A4 HTML 文档（矢量中文、可搜索；窗口内不含任何内联脚本）
+  function buildPrintDocument(theme, fileName) {
+    const content = getStore(STORE_KEYS.optimized, '');
+    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const inner = buildResumeHTML(content, theme, { watermark: wm });
+    return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>${esc(fileName)}</title>
+<style>
+  *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+  @page{ size:A4; margin:0; }
+  html,body{ margin:0; padding:0; background:#eef2f7;
+             font-family:'Microsoft YaHei','PingFang SC',sans-serif; }
+  .toolbar{ position:sticky; top:0; z-index:9; display:flex; align-items:center; gap:10px;
+            flex-wrap:wrap; padding:12px 18px; background:#0f172a; color:#e2e8f0; font-size:13px; }
+  .toolbar b{ font-size:14px; }
+  .toolbar .hint{ color:#94a3b8; }
+  .stage{ padding:18px 0 30px; }
+  .rs-wrap{ margin:0 auto; box-shadow:0 2px 14px rgba(15,23,42,.14); }
+  @media print{
+    html,body{ background:#fff; }
+    .toolbar{ display:none !important; }
+    .stage{ padding:0; }
+    .rs-wrap{ box-shadow:none; margin:0; width:210mm; }
+    .rs-sec{ break-inside:avoid; page-break-inside:avoid; }
+    .rs-li,.rs-sub,.rs-p{ break-inside:avoid; page-break-inside:avoid; }
+  }
+</style></head>
+<body>
+  <div class="toolbar">
+    <b>📄 ${esc(fileName)}</b>
+    <span class="hint">若未自动弹出打印框：按 Ctrl+P → 目标位置选「另存为 PDF」→ 保存</span>
+  </div>
+  <div class="stage"><div id="resume-root">${inner}</div></div>
+</body></html>`;
+  }
+
+  // 打开打印窗口生成 PDF（窗口由本页代为调起打印，避免新窗口内脚本被 CSP 拦截而白屏）
+  function openResumePrintWindow() {
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    const fileName = `简历-优化-${safeName(meta.title) || '岗位'}`;
+    const win = window.open('', '_blank');
+    if (!win) { toast('弹窗被拦截：请允许本站弹窗后重试', 'err'); return false; }
+    try {
+      win.document.open();
+      win.document.write(buildPrintDocument(getResumeTheme(), fileName));
+      win.document.close();
+    } catch (e) { return false; }
+    setTimeout(() => { try { win.focus(); win.print(); } catch (e) {} }, 900);
+    return true;
   }
 
   function downloadResumePDF() {
     if (!getStore(STORE_KEYS.optimized, '')) { toast('还没有优化结果，请先点击「开始优化」', 'err'); return; }
-    toast('正在渲染简历并生成 PDF，请稍候…', 'info');
-    renderResumeCanvas().then((canvas) => {
-      const meta = getStore(STORE_KEYS.jdMeta, {});
-      canvasToPdf(canvas, `简历-优化-${safeName(meta.title)}.pdf`);
-      toast('PDF 已下载', 'ok');
-    }).catch(() => {});
+    toast('正在生成 PDF 文件，请稍候…', 'info');
+    buildResumePdf()
+      .then((f) => toast('✅ 已下载 ' + f + '。需要「文字可复制」的矢量 PDF 可用「打印 / 另存为 PDF」', 'ok'))
+      .catch(() => {
+        toast('PDF 组件不可用（可能断网），已打开打印窗口兜底', 'info');
+        openResumePrintWindow();
+      });
   }
 
   function downloadResumeImage() {
@@ -886,8 +1267,8 @@
     toast('正在渲染简历图片，请稍候…', 'info');
     renderResumeCanvas().then((canvas) => {
       const meta = getStore(STORE_KEYS.jdMeta, {});
-      canvasDownload(canvas, `简历-优化-${safeName(meta.title)}.png`);
-    }).catch(() => {});
+      canvasDownload(canvas, `简历-优化-${safeName(meta.title) || '岗位'}.png`);
+    }).catch((e) => toast('图片渲染失败：' + (e && e.message || e), 'err'));
   }
 
   /* ============================================================
@@ -1140,14 +1521,18 @@
         <div class="brh-status" id="brh-optimize-status">${content ? '✅ 已有优化结果 ' + nowStr() : ''}</div>
         ${content ? `
         <div class="brh-row">
-          <button class="brh-btn green sm" id="brh-dl-pdf">⬇️ 下载 PDF</button>
-          <button class="brh-btn ghost sm" id="brh-dl-doc">⬇️ 下载 .doc</button>
+          <button class="brh-btn green sm" id="brh-dl-pdf">📄 导出 PDF 文件</button>
+          <button class="brh-btn ghost sm" id="brh-dl-print">🖨 打印 / 另存为 PDF</button>
+        </div>
+        <div class="brh-row">
           <button class="brh-btn ghost sm" id="brh-dl-img">🖼 下载简历图片</button>
+          <button class="brh-btn ghost sm" id="brh-dl-doc">⬇️ 下载 .doc</button>
         </div>
         <div class="brh-row">
           <span class="brh-chip">当前版式：${esc(RESUME_THEMES[getResumeTheme()].name)}</span>
           <button class="brh-btn ghost sm" id="brh-theme-switch">🎨 切换版式</button>
         </div>
+        <div class="brh-tip">「导出 PDF 文件」直接得到 .pdf 文件（多页 A4，自动排版）；需要文字可复制/可搜索的矢量 PDF 时用「打印 / 另存为 PDF」。组件加载失败时自动回退到打印窗口。</div>
         <textarea class="brh-area" id="brh-opt-area" style="min-height:240px">${esc(content)}</textarea>
         <div class="brh-tip">可手动微调后重新下载；发送给 HR 前建议通读一遍，确保经历真实。</div>
         <div class="brh-row" style="margin-top:12px">
@@ -1169,10 +1554,13 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = '🚀 开始优化'; }, 1500);
       };
       const pdfBtn = $('#brh-dl-pdf'); if (pdfBtn) pdfBtn.onclick = downloadResumePDF;
+      const printBtn = $('#brh-dl-print'); if (printBtn) printBtn.onclick = () => { openResumePrintWindow(); };
       const doc = $('#brh-dl-doc'); if (doc) doc.onclick = () => downloadOptimized('doc');
       const imgBtn = $('#brh-dl-img'); if (imgBtn) imgBtn.onclick = downloadResumeImage;
       const ths = $('#brh-theme-switch'); if (ths) ths.onclick = () => {
-        setResumeTheme(getResumeTheme() === 'modern' ? 'business' : 'modern');
+        const order = Object.keys(RESUME_THEMES);
+        const i = order.indexOf(getResumeTheme());
+        setResumeTheme(order[(i + 1) % order.length]);
         const nm = RESUME_THEMES[getResumeTheme()].name;
         toast('已切换为「' + nm + '」版式', 'ok');
         this.renderOptimized(getStore(STORE_KEYS.optimized, ''));
@@ -1207,6 +1595,8 @@
       const body = $('#brh-body', this.root);
       const optimized = getStore(STORE_KEYS.optimized, '');
       const isChat = /\/web\/geek\/chat|\/chat/.test(location.pathname);
+      const hrQ = getStore(STORE_KEYS.hrQuestion, '');
+      const hrA = getStore(STORE_KEYS.hrReply, '');
       body.innerHTML = `
         <div class="brh-row">
           <span class="brh-chip">优化简历 ${optimized ? '已就绪' : '未生成'}</span>
@@ -1220,19 +1610,51 @@
         <textarea class="brh-area" id="brh-greet-area" style="min-height:110px">${esc(content)}</textarea>
         <div class="brh-row" style="margin-top:8px">
           <button class="brh-btn green" id="brh-fill">📝 填入聊天框</button>
+          <button class="brh-btn warn sm" id="brh-attach" ${optimized ? '' : 'disabled'}>🖼 向当前对话发送简历图片</button>
         </div>
-        <div class="brh-row" style="margin-top:10px">
-          <button class="brh-btn warn" id="brh-attach" ${optimized ? '' : 'disabled'}>🖼 向当前对话发送简历图片</button>
-        </div>
-        <div class="brh-tip">提示：填入话术后请人工检查再发送。简历会以<b>图片</b>形式附加（排版好看、手机端不乱码）；若页面拦截自动附加，脚本会自动把图片下载到本地，你手动点聊天窗口「图片」按钮发送即可。版式可在「✨ 优化」页切换。</div>` : `
+        <div class="brh-tip">简历以<b>图片</b>形式附加（排版好看、手机端不乱码）；若页面拦截自动附加，图片会自动下载到本地，手动点聊天窗口「图片」按钮发送即可。</div>` : `
         <div class="brh-tip">先生成打招呼话术；然后可一键填入 Boss 聊天框，并把优化后的简历以图片形式发给当前 HR。</div>`}
-      `;
+
+        <div class="brh-row" style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
+          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 提问 + 优化简历生成</span></div>
+          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新提问；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn" id="brh-hr-gen" ${optimized ? '' : 'disabled title="请先在「优化」页生成优化简历"'}>💬 生成针对性回复</button>
+            ${hrA ? '<button class="brh-btn ghost sm" id="brh-hr-regen">🔄 换个说法</button>' : ''}
+          </div>
+          ${hrA ? `
+          <textarea class="brh-area" id="brh-hr-reply" style="min-height:110px;margin-top:8px">${esc(hrA)}</textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn green sm" id="brh-hr-copy">📋 复制回复</button>
+            <button class="brh-btn sm" id="brh-hr-fill">📝 填入聊天框</button>
+          </div>` : ''}
+          <div class="brh-tip">在 HR 聊天页点「生成针对性回复」，脚本会读取 HR 最新提问，结合优化后的简历与岗位 JD 生成第一人称回复；生成后请核对数字与事实再发送。</div>
+        </div>`;
       const gen = $('#brh-gen-greeting'); if (gen) gen.onclick = generateGreeting;
       const area = $('#brh-greet-area');
       if (area) area.addEventListener('change', (e) => setStore(STORE_KEYS.greeting, e.target.value));
       const fill = $('#brh-fill'); if (fill) fill.onclick = () => fillGreeting($('#brh-greet-area').value.trim());
       const attach = $('#brh-attach'); if (attach) attach.onclick = sendResumeImage;
+      const hrGen = $('#brh-hr-gen'); if (hrGen) hrGen.onclick = () => {
+        setStore(STORE_KEYS.hrQuestion, $('#brh-hr-q').value.trim());
+        generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
+      };
+      const hrRegen = $('#brh-hr-regen'); if (hrRegen) hrRegen.onclick = () => generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
+      const hrCopy = $('#brh-hr-copy'); if (hrCopy) hrCopy.onclick = () => {
+        const v = $('#brh-hr-reply').value.trim();
+        if (!v) { toast('暂无回复', 'err'); return; }
+        navigator.clipboard.writeText(v).then(() => toast('回复已复制', 'ok'), () => toast('复制失败，请手动选择', 'err'));
+      };
+      const hrFill = $('#brh-hr-fill'); if (hrFill) hrFill.onclick = () => {
+        setStore(STORE_KEYS.hrReply, $('#brh-hr-reply').value);
+        fillGreeting($('#brh-hr-reply').value.trim());
+      };
+      const hrQArea = $('#brh-hr-q');
+      if (hrQArea) hrQArea.addEventListener('change', (e) => setStore(STORE_KEYS.hrQuestion, e.target.value.trim()));
     },
+
+    /* HR 智能回复生成完毕后刷新聊天页（问题与回复已入存储） */
+    renderHrReply() { this.renderGreeting(getStore(STORE_KEYS.greeting, '')); },
 
     /* ---- 选岗页 ---- */
     renderMatchTab() {
@@ -1305,6 +1727,10 @@
           <select class="brh-input" id="brh-cfg-theme" style="height:30px">
             <option value="modern" ${getResumeTheme() === 'modern' ? 'selected' : ''}>现代简约（白底 + 主色标题条，通用推荐）</option>
             <option value="business" ${getResumeTheme() === 'business' ? 'selected' : ''}>深色商务（深蓝侧边栏，视觉冲击强）</option>
+            <option value="elegant" ${getResumeTheme() === 'elegant' ? 'selected' : ''}>雅致衬线（居中标题 + 衬线字，稳重耐看）</option>
+            <option value="ocean" ${getResumeTheme() === 'ocean' ? 'selected' : ''}>深海渐变（渐变横幅头部，个性醒目）</option>
+            <option value="vitality" ${getResumeTheme() === 'vitality' ? 'selected' : ''}>活力橙红（时间线经历，突出成长）</option>
+            <option value="jade" ${getResumeTheme() === 'jade' ? 'selected' : ''}>青玉留白（极简双线，清爽克制）</option>
           </select>
         </div>
         <div class="brh-row">

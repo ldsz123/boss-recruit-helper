@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>简历版式预览 · Boss招聘小助手</title>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px;background:#eef2f7;color:#0f172a;
+       font:14px/1.7 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif}
+  .bar{position:sticky;top:0;z-index:20;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+       padding:12px 16px;margin:-20px -20px 18px;background:#0f172a;color:#e2e8f0}
+  .bar b{font-size:15px}
+  .bar .h{color:#94a3b8;font-size:12.5px}
+  .bar select,.bar button{height:32px;padding:0 12px;border:0;border-radius:8px;font-size:13px;
+       font-family:inherit;cursor:pointer;font-weight:600}
+  .bar select{background:#334155;color:#e2e8f0}
+  .bar button{background:#2563eb;color:#fff}
+  .bar button.gh{background:#475569}
+  .stage{display:flex;flex-direction:column;align-items:center;gap:24px}
+  .paper{background:#fff;box-shadow:0 4px 18px rgba(15,23,42,.16);transform-origin:top center}
+  .lab{color:#64748b;font-size:12px;text-align:center}
+  .editor{margin-top:26px;background:#fff;border-radius:12px;padding:14px}
+  .editor textarea{width:100%;min-height:180px;border:1px solid #cbd5e1;border-radius:8px;
+       padding:10px;font:12.5px/1.7 ui-monospace,Menlo,Consolas,monospace;color:#0f172a}
+  .hide{display:none}
+  @media print{ .bar,.editor{display:none!important} body{background:#fff;padding:0} }
+</style></head>
+<body>
+<div class="bar">
+  <b>🎨 简历版式预览</b>
+  <select id="theme">
+    <option value="modern">现代简约</option>
+    <option value="business">深色商务</option>
+    <option value="elegant">雅致衬线</option>
+    <option value="ocean">深海渐变</option>
+    <option value="vitality">活力橙红</option>
+    <option value="jade">青玉留白</option>
+    <option value="all">六种并排对比</option>
+  </select>
+  <select id="zoom"><option value="0.6">60%</option><option value="0.8">80%</option>
+    <option value="1" selected>100%</option><option value="1.3">130%</option></select>
+  <span class="h">「下载 PDF」直接得到 .pdf 文件；「打印」可存矢量 PDF</span>
+  <span style="flex:1"></span>
+  <button id="btn-print">🖨 打印 / 存 PDF</button>
+  <button class="gh" id="btn-png">🖼 导出长图</button>
+  <button class="gh" id="btn-pdf">📄 下载 PDF</button>
+</div>
+
+<div class="stage" id="stage"></div>
+
+<div class="editor">
+  <div style="font-weight:600;margin-bottom:6px">简历内容（Markdown，可粘贴你自己的）</div>
+  <textarea id="md"></textarea>
+  <div style="margin-top:8px"><button class="gh" style="background:#2563eb;color:#fff" id="btn-render">重新渲染</button></div>
+</div>
+
+<script>
+/* ---- 以下渲染代码由 build-preview.js 从 boss-recruit-helper.user.js 提取，保持与脚本一致 ---- */
+const CHIP_TITLE_RE = /(技能|专长|能力|证书|标签|工具|语言|Skills?)/i;
+
+const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+
+function inlineMd(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  }
+
+function extractContacts(md) {
+    const text = String(md || '');
+    return {
+      phone: (text.match(/1[3-9]\d{9}/) || [])[0] || '',
+      email: (text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/) || [])[0] || ''
+    };
+  }
+
+function parseResumeMarkdown(md) {
+    const lines = String(md || '').split(/\r?\n/);
+    const data = { name: '', headline: '', sections: [] };
+    let cur = null;
+    const ensureSec = () => {
+      if (!cur) { cur = { title: '', paras: [], items: [] }; data.sections.push(cur); }
+      return cur;
+    };
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || /^(-{3,}|\*{3,}|={3,})$/.test(line)) continue;
+      const h1 = line.match(/^#\s+(.*)$/);
+      const h2 = line.match(/^##\s+(.*)$/);
+      const h3 = line.match(/^###\s+(.*)$/);
+      const li = line.match(/^[-*+]\s+(.*)$/);
+      if (h1) { if (!data.name) data.name = h1[1].trim(); else { ensureSec().items.push({ sub: h1[1].trim() }); } continue; }
+      if (h2) { cur = { title: h2[1].trim(), paras: [], items: [] }; data.sections.push(cur); continue; }
+      if (h3) { ensureSec().items.push({ sub: h3[1].trim() }); continue; }
+      if (li) { ensureSec().items.push({ text: li[1].trim() }); continue; }
+      if (!data.name) { data.name = line.replace(/^#+\s*/, ''); continue; }
+      if (!data.headline && !cur) { data.headline = line; continue; }
+      ensureSec().paras.push(line);
+    }
+    return data;
+  }
+
+function buildResumeHTML(md, theme, opts) {
+    const d = parseResumeMarkdown(md);
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    const th = RESUME_THEMES[theme] ? RESUME_THEMES[theme] : RESUME_THEMES.modern;
+    const accent = th.accent;
+    const soft = th.soft || '#eef6fc';
+    const wm = (opts && opts.watermark) ? String(opts.watermark) : '';
+    const ct = extractContacts(md);
+    const today = nowStr().slice(0, 10);
+
+    // 姓名行常写成「张三 — 应聘岗位」，拆开更美观
+    let name = d.name || '个人简历';
+    let head = d.headline || '';
+    const nmSplit = name.match(/^(.{2,8}?)\s*[—–\-|｜·]\s*(.+)$/);
+    if (nmSplit) { name = nmSplit[1].trim(); if (!head) head = nmSplit[2].trim(); }
+
+    // 页眉已单独展示联系方式，正文里同款信息去掉，避免重复
+    const cleanBit = (s) => {
+      let t = String(s || '')
+        .split(ct.phone).join('').split(ct.email).join('')
+        .replace(/\*\*|__|`/g, '')
+        .replace(/电\s*话\s*[:：]?/g, '').replace(/邮\s*箱\s*[:：]?/g, '');
+      t = t.replace(/[\s|｜·、,，/]*[|｜][\s|｜·、,，/]*/g, ' | ');   // 分隔符规整
+      return t.replace(/\s{2,}/g, ' ')
+        .replace(/^[\s|｜·、,，/]+|[\s|｜·、,，/]+$/g, '')
+        .trim();
+    };
+    head = cleanBit(head);
+    if (!head) head = meta.title ? `求职意向：${meta.title}${meta.salary ? '　·　' + meta.salary : ''}` : '';
+
+    const contactBits = [ct.phone, ct.email].filter(Boolean);
+    const contactHtml = contactBits.length
+      ? `<div class="rs-contact">${contactBits.map((b) => `<span>${inlineMd(b)}</span>`).join('')}</div>`
+      : '';
+
+    // 正文里若已出现联系方式，就不再重复渲染该行
+    const dropContact = (t) => {
+      if (!t) return false;
+      if (ct.phone && t.indexOf(ct.phone) >= 0) return true;
+      if (ct.email && t.indexOf(ct.email) >= 0) return true;
+      return false;
+    };
+
+    const sectionsHtml = d.sections.map((s) => {
+      const isChip = CHIP_TITLE_RE.test(s.title || '');
+      let inner = '';
+      (s.paras || []).forEach((p) => {
+        if (dropContact(p)) return;
+        inner += `<div class="rs-p">${inlineMd(p)}</div>`;
+      });
+      (s.items || []).forEach((it) => {
+        if (dropContact(it.text || it.sub || '')) return;
+        if (it.sub) { inner += `<div class="rs-sub">${inlineMd(it.sub)}</div>`; return; }
+        if (isChip) { inner += `<span class="rs-chip">${inlineMd(it.text)}</span>`; return; }
+        inner += `<div class="rs-li"><i class="rs-dot"></i><div>${inlineMd(it.text)}</div></div>`;
+      });
+      if (!inner) return '';
+      const titleHtml = s.title
+        ? `<div class="rs-sec-t"><span class="rs-bar"></span><span class="rs-sec-txt">${inlineMd(s.title)}</span><span class="rs-sec-line"></span></div>`
+        : '';
+      return `<div class="rs-sec">${titleHtml}${isChip ? `<div class="rs-chips">${inner}</div>` : inner}</div>`;
+    }).join('');
+
+    const wmTag = wm ? `<span class="rs-foot-lic">${esc(wm)}</span>` : '';
+    const foot = `<div class="rs-foot"><span>Boss招聘小助手 · 定制优化</span><span>${today}${meta.company ? ' · 投递 ' + inlineMd(meta.company) : ''}</span>${wmTag}</div>`;
+    const wmHtml = wm
+      ? `<div class="rs-wm" aria-hidden="true"><span>${esc(wm)}</span><span>${esc(wm)}</span><span>${esc(wm)}</span></div>`
+      : '';
+
+    const style = `
+      .rs-wrap{ width:794px; background:#fff; color:#262626; box-sizing:border-box; position:relative; overflow:hidden;
+                font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Source Han Sans SC',sans-serif; }
+      .rs-wrap *{ box-sizing:border-box; }
+      .rs-wm{ position:absolute; left:0; top:0; right:0; bottom:0; z-index:9; pointer-events:none;
+              display:flex; flex-direction:column; justify-content:space-evenly; align-items:center;
+              transform:rotate(-24deg); }
+      .rs-wm span{ font-size:24px; font-weight:700; color:rgba(100,116,139,.06); letter-spacing:4px; white-space:nowrap; }
+      .rs-foot-lic{ color:#b91c1c; opacity:.72; }
+      .rs-sec{ margin-bottom:15px; }
+      .rs-sec-t{ display:flex; align-items:center; margin-bottom:9px; }
+      .rs-bar{ width:4px; height:15px; background:${accent}; border-radius:2px; margin-right:8px; }
+      .rs-sec-txt{ font-size:15px; font-weight:700; color:${accent}; letter-spacing:1px; white-space:nowrap; }
+      .rs-sec-line{ flex:1; height:1px; margin-left:10px;
+                    background:linear-gradient(to right,${accent},rgba(255,255,255,0)); opacity:.5; }
+      .rs-sub{ font-size:13px; font-weight:700; color:#1f2937; margin:11px 0 5px; padding-left:9px;
+               border-left:3px solid ${accent}; }
+      .rs-p{ font-size:12.5px; line-height:1.85; margin:3px 0; color:#374151; }
+      .rs-li{ display:flex; align-items:flex-start; font-size:12.5px; line-height:1.85; margin:4px 0; color:#374151; }
+      .rs-dot{ flex:0 0 auto; width:5px; height:5px; background:${accent}; border-radius:1px;
+               margin:9px 9px 0 3px; transform:rotate(45deg); }
+      .rs-li>div{ flex:1; }
+      .rs-chips{ display:flex; flex-wrap:wrap; gap:7px; }
+      .rs-chip{ display:inline-block; font-size:12px; line-height:1.6; padding:3px 11px; border-radius:11px;
+                background:${soft}; color:#1f2937; border:1px solid ${accent}33; }
+      .rs-foot{ display:flex; justify-content:space-between; font-size:10.5px; color:#9ca3af;
+                margin-top:18px; padding-top:9px; border-top:1px dashed #e5e7eb; }
+      .rs-contact{ display:flex; gap:16px; font-size:12px; color:#4b5563; }
+      .rs-contact span{ display:inline-flex; align-items:center; }
+      .rs-contact span::before{ content:''; width:4px; height:4px; border-radius:50%;
+                                background:${accent}; margin-right:6px; }
+
+      /* ---------- 版式一：现代简约 ---------- */
+      .rs-modern{ padding:40px 48px 30px; }
+      .rs-modern .rs-top{ display:flex; align-items:flex-end; justify-content:space-between;
+                          padding-bottom:16px; margin-bottom:20px; border-bottom:3px solid ${accent}; }
+      .rs-modern .rs-name{ font-size:31px; font-weight:700; color:#111827; letter-spacing:4px; line-height:1.2; }
+      .rs-modern .rs-head{ font-size:13.5px; color:${accent}; margin-top:9px; font-weight:600; letter-spacing:.5px; }
+
+      /* ---------- 版式二：深色商务（左右分栏） ---------- */
+      .rs-business{ display:flex; min-height:1123px; }
+      .rs-business .rs-side{ width:240px; flex:0 0 240px; background:${accent}; color:#fff; padding:40px 26px; }
+      .rs-business .rs-side .rs-name{ font-size:27px; font-weight:700; letter-spacing:3px; line-height:1.35; }
+      .rs-business .rs-side .rs-line{ width:40px; height:3px; background:#fff; opacity:.9; margin:16px 0 14px; }
+      .rs-business .rs-side .rs-head{ font-size:12.5px; line-height:1.9; opacity:.95; }
+      .rs-business .rs-side .rs-contact{ margin-top:14px; color:#fff; opacity:.9; font-size:11.5px; flex-direction:column; gap:5px; }
+      .rs-business .rs-side .rs-contact span::before{ background:#fff; }
+      .rs-business .rs-side .rs-tag{ margin-top:24px; font-size:11px; opacity:.72; line-height:1.8;
+                                     border-top:1px solid rgba(255,255,255,.28); padding-top:12px; }
+      .rs-business .rs-main{ flex:1; padding:40px 40px 30px; background:#fff; }
+      .rs-business .rs-sec-txt{ color:${accent}; }
+
+      /* ---------- 版式三：雅致衬线 ---------- */
+      .rs-elegant{ padding:44px 52px 30px; font-family:Georgia,'Songti SC','SimSun','Microsoft YaHei',serif; }
+      .rs-elegant .rs-top{ text-align:center; padding-bottom:18px; margin-bottom:22px;
+                           border-bottom:1px solid ${accent}; position:relative; }
+      .rs-elegant .rs-top::after{ content:''; position:absolute; left:50%; bottom:-4px; width:56px; height:7px;
+                                  margin-left:-28px; background:#fff; border-left:1px solid ${accent};
+                                  border-right:1px solid ${accent}; }
+      .rs-elegant .rs-name{ font-size:30px; font-weight:700; color:${accent}; letter-spacing:6px; }
+      .rs-elegant .rs-head{ font-size:13px; color:#6b7280; margin-top:10px; letter-spacing:1px; }
+      .rs-elegant .rs-contact{ justify-content:center; margin-top:8px; }
+      .rs-elegant .rs-sec-txt{ color:${accent}; font-weight:600; }
+      .rs-elegant .rs-bar{ background:${accent}; }
+
+      /* ---------- 版式四：深海渐变（渐变横幅头部） ---------- */
+      .rs-ocean{ padding:0 48px 30px; }
+      .rs-ocean .rs-top{ margin:0 -48px 24px; padding:34px 48px 26px; color:#fff;
+                         background:linear-gradient(120deg,${accent} 0%,${accent}dd 55%,#7c3aed 130%);
+                         display:flex; align-items:flex-end; justify-content:space-between; }
+      .rs-ocean .rs-name{ font-size:31px; font-weight:700; letter-spacing:5px; color:#fff; }
+      .rs-ocean .rs-head{ font-size:13px; margin-top:9px; color:#fff; opacity:.92; letter-spacing:.5px; }
+      .rs-ocean .rs-contact{ color:rgba(255,255,255,.92); font-size:11.5px; gap:14px; }
+      .rs-ocean .rs-contact span::before{ background:#fff; }
+      .rs-ocean .rs-sec-t{ border:0; }
+      .rs-ocean .rs-sec-txt{ color:${accent}; }
+      .rs-ocean .rs-sec-line{ background:linear-gradient(to right,${accent},rgba(255,255,255,0)); }
+      .rs-ocean .rs-sec:first-of-type{ margin-top:-6px; }
+
+      /* ---------- 版式五：活力橙红（时间线） ---------- */
+      .rs-vitality{ padding:40px 48px 30px; }
+      .rs-vitality .rs-top{ display:flex; align-items:flex-end; gap:14px; margin-bottom:22px; }
+      .rs-vitality .rs-name{ font-size:30px; font-weight:800; color:#1c1917; letter-spacing:3px; }
+      .rs-vitality .rs-top .rs-head{ font-size:13px; color:#fff; background:${accent}; padding:4px 12px;
+                                     border-radius:14px; margin-bottom:6px; font-weight:600; }
+      .rs-vitality .rs-contact{ margin-bottom:18px; }
+      .rs-vitality .rs-sec{ position:relative; padding-left:20px; }
+      .rs-vitality .rs-sec::before{ content:''; position:absolute; left:5px; top:5px; bottom:2px; width:2px;
+                                    background:linear-gradient(${accent},${accent}22); border-radius:1px; }
+      .rs-vitality .rs-sec::after{ content:''; position:absolute; left:0; top:2px; width:12px; height:12px;
+                                   border-radius:50%; background:${accent}; border:3px solid ${soft}; }
+      .rs-vitality .rs-sec-t{ margin-bottom:8px; }
+      .rs-vitality .rs-bar{ display:none; }
+      .rs-vitality .rs-sec-txt{ color:${accent}; }
+      .rs-vitality .rs-sec-line{ display:none; }
+      .rs-vitality .rs-chip{ background:${accent}; color:#fff; border:0; border-radius:6px; font-weight:600; }
+
+      /* ---------- 版式六：青玉留白（极简双线） ---------- */
+      .rs-jade{ padding:46px 56px 30px; }
+      .rs-jade .rs-top{ text-align:center; padding-bottom:16px; margin-bottom:6px; }
+      .rs-jade .rs-name{ font-size:29px; font-weight:600; color:#134e4a; letter-spacing:10px; text-indent:10px; }
+      .rs-jade .rs-head{ font-size:12.5px; color:#6b7280; margin-top:9px; letter-spacing:2px; }
+      .rs-jade .rs-contact{ justify-content:center; margin-top:10px; }
+      .rs-jade .rs-topline{ height:3px; margin:14px 0 20px; border-top:2px solid #134e4a; border-bottom:1px solid #134e4a; }
+      .rs-jade .rs-sec-t{ margin-bottom:10px; }
+      .rs-jade .rs-bar{ width:9px; height:9px; background:${accent}; border-radius:2px; transform:rotate(45deg); margin-right:9px; }
+      .rs-jade .rs-sec-txt{ color:#134e4a; letter-spacing:3px; }
+      .rs-jade .rs-sec-line{ background:linear-gradient(to right,#99f6e4,rgba(255,255,255,0)); }
+      .rs-jade .rs-sub{ border-left-color:${accent}; }
+    `;
+
+    const headBlock = head
+      ? `<div class="rs-head">${inlineMd(head)}</div>`
+      : '';
+    /* 水印层插在 .rs-wrap 内部（absolute 定位以简历纸面为参照） */
+    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}">${wmHtml}${inner}</div>`;
+    const body = theme === 'business'
+      ? withWm('rs-business', `
+           <div class="rs-side">
+             <div class="rs-name">${inlineMd(name)}</div>
+             <div class="rs-line"></div>
+             <div class="rs-head">${inlineMd(head)}</div>
+             ${contactHtml}
+             <div class="rs-tag">Boss招聘小助手<br/>按岗位 JD 定制优化</div>
+           </div>
+           <div class="rs-main">${sectionsHtml}${foot}</div>
+         `)
+      : theme === 'elegant'
+      ? withWm('rs-elegant', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'ocean'
+      ? withWm('rs-ocean', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'vitality'
+      ? withWm('rs-vitality', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+           </div>
+           ${contactHtml}
+           ${sectionsHtml}${foot}
+         `)
+      : theme === 'jade'
+      ? withWm('rs-jade', `
+           <div class="rs-top">
+             <div class="rs-name">${inlineMd(name)}</div>
+             ${headBlock}
+             ${contactHtml}
+           </div>
+           <div class="rs-topline"></div>
+           ${sectionsHtml}${foot}
+         `)
+      : withWm('rs-modern', `
+           <div class="rs-top">
+             <div>
+               <div class="rs-name">${inlineMd(name)}</div>
+               ${headBlock}
+             </div>
+             ${contactHtml}
+           </div>
+           ${sectionsHtml}${foot}
+         `);
+
+    return `<style>${style}</style>${body}`;
+  }
+
+function nodeToCanvas(node, w, h, scale) {
+    return new Promise((resolve, reject) => {
+      let xml = '';
+      try { xml = new XMLSerializer().serializeToString(node); }
+      catch (e) { reject(new Error('HTML 序列化失败：' + e.message)); return; }
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (w * scale) + '" height="' + (h * scale) +
+        '" viewBox="0 0 ' + w + ' ' + h + '">' +
+        '<foreignObject x="0" y="0" width="100%" height="100%">' + xml + '</foreignObject></svg>';
+      const img = new Image();
+      img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(w * scale);
+        cv.height = Math.round(h * scale);
+        const ctx = cv.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        try { ctx.drawImage(img, 0, 0, cv.width, cv.height); }
+        catch (e) { reject(new Error('绘制失败：' + e.message)); return; }
+        resolve(cv);
+      };
+      img.onerror = () => reject(new Error('SVG 渲染失败（浏览器不支持或内容含非法标签）'));
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    });
+  }
+
+function safeName(s) {
+    return String(s || '').replace(/[\\/:*?"<>|\s]+/g, '').slice(0, 30) || '优化简历';
+  }
+
+function buildPrintDocument(theme, fileName) {
+    const content = getStore(STORE_KEYS.optimized, '');
+    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const inner = buildResumeHTML(content, theme, { watermark: wm });
+    return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>${esc(fileName)}</title>
+<style>
+  *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+  @page{ size:A4; margin:0; }
+  html,body{ margin:0; padding:0; background:#eef2f7;
+             font-family:'Microsoft YaHei','PingFang SC',sans-serif; }
+  .toolbar{ position:sticky; top:0; z-index:9; display:flex; align-items:center; gap:10px;
+            flex-wrap:wrap; padding:12px 18px; background:#0f172a; color:#e2e8f0; font-size:13px; }
+  .toolbar b{ font-size:14px; }
+  .toolbar .hint{ color:#94a3b8; }
+  .stage{ padding:18px 0 30px; }
+  .rs-wrap{ margin:0 auto; box-shadow:0 2px 14px rgba(15,23,42,.14); }
+  @media print{
+    html,body{ background:#fff; }
+    .toolbar{ display:none !important; }
+    .stage{ padding:0; }
+    .rs-wrap{ box-shadow:none; margin:0; width:210mm; }
+    .rs-sec{ break-inside:avoid; page-break-inside:avoid; }
+    .rs-li,.rs-sub,.rs-p{ break-inside:avoid; page-break-inside:avoid; }
+  }
+</style></head>
+<body>
+  <div class="toolbar">
+    <b>📄 ${esc(fileName)}</b>
+    <span class="hint">若未自动弹出打印框：按 Ctrl+P → 目标位置选「另存为 PDF」→ 保存</span>
+  </div>
+  <div class="stage"><div id="resume-root">${inner}</div></div>
+</body></html>`;
+  }
+
+/* ---- 桩：替换脚本里依赖存储/UI 的部分（渲染代码本身来自正式版） ---- */
+var NOW = new Date();
+function nowStr(){ return NOW.toISOString().slice(0,10) + ' 00:00:00'; }
+var STORE_KEYS = { optimized: 'brh_optimized', jdMeta: 'brh_jd_meta' };
+var JD_META = { title: '店小蜜训练师', company: '示例科技', salary: '8-12K' };
+var CUR_MD = '';
+function getStore(k){ return k === STORE_KEYS.optimized ? CUR_MD : JD_META; }
+function setStore(){}
+var RESUME_THEMES = {
+  modern:{name:'现代简约',accent:'#0ea5e9',soft:'#e8f6fe',layout:'modern'},
+  business:{name:'深色商务',accent:'#1e3a5f',soft:'#eef2f7',layout:'business'},
+  elegant:{name:'雅致衬线',accent:'#8a5a3b',soft:'#f7f0ea',layout:'elegant'},
+  ocean:{name:'深海渐变',accent:'#2563eb',soft:'#dbeafe',layout:'ocean'},
+  vitality:{name:'活力橙红',accent:'#ea580c',soft:'#ffedd5',layout:'vitality'},
+  jade:{name:'青玉留白',accent:'#0f766e',soft:'#ccfbf1',layout:'jade'}
+};
+/* ------------------------------------------------------------------ */
+
+var mdEl = document.getElementById('md');
+mdEl.value = "# 龚俊祥 — AI训练师（智能客服方向）\r\n\r\n**电话：** 17758751619 ｜ **邮箱：** 1691594247@qq.com ｜ **男 ｜ 现居厦门**\r\n\r\n**求职意向：** 店小蜜训练师 / AI训练师（智能客服与大模型应用方向）　**期望薪资：** 13-18K　**意向城市：** 厦门\r\n\r\n---\r\n\r\n## 核心优势\r\n\r\n- **店小蜜实战 2 年+**：独立完成店小蜜知识库搭建、意图识别调优与多轮兜底话术设计，机器人覆盖 80% 常规咨询，用户满意度稳定 96% 以上，直接对齐岗位「知识库搭建、意图识别优化、多轮对话流程设计」要求；\r\n- **指标驱动优化闭环**：建立「用户问题收集 → 话术更新 → 线上测试 → 效果复盘」迭代闭环，通过 Bad Case（漏答、误判）清单定位知识盲区，推动售后处理时长下降 30%；\r\n- **大模型训练与评测**：具备生成式 AI 训练全流程经验——指令/问答语料构建、结构化提示词体系、多维度效果评测与迭代，单条内容生产周期压缩 62%，可迁移至大语言模型智能体搭建场景；\r\n- **体系沉淀与团队赋能**：输出售后话术手册、店小蜜配置文档、标注手册与测试案例，定期开展新人培训并建立质量抽检复核机制，具备带教 3 人训练师团队所需的标准化与培训能力。\r\n\r\n---\r\n\r\n## 工作经历\r\n\r\n### 厦门微制造有限公司 ｜ AI训练与AIGC内容数据专员 ｜ 2026.04 - 2026.06\r\n\r\n聚焦生成式 AI 训练与业务场景适配，负责训练需求拆解、语料构建、提示词优化、样本质检、模型输出评测及迭代反馈，支撑内容业务规模化生产。\r\n\r\n- **训练任务设计**：将业务内容需求拆解为可执行的训练目标，编写指令、问答与生成任务规范，搭建结构化提示词体系和标准化工作流，提升 AI 输出与业务要求的匹配度；\r\n- **训练数据构建**：整理文本、图片、视频等多模态样本，补充正例、反例与边界案例，统一数据格式、标签口径和验收标准，保证训练样本的一致性与可复用性；\r\n- **模型评测与优化**：从准确性、相关性、完整性、风格一致性等维度评测生成结果，归纳错误类型并推动参数、提示词与流程迭代，**单条内容生产周期压缩 62%**；\r\n- **质量管理与培训**：负责样本抽检、问题复核和异常排查，对接 AI 工具服务商同步训练需求，输出标注手册、操作手册和测试案例，开展内部培训并沉淀可复用模板。\r\n\r\n### 拉伯塔商业运营有限公司 ｜ AI训练数据与用户运营专员 ｜ 2024.02 - 2026.04\r\n\r\n负责店小蜜智能客服工具落地运维，精通天猫平台售后规范与退换货流程，规范化处置售后工单，保障售后流程合规高效。\r\n\r\n- **售后流程标准化**：承接全平台售后咨询与退换货诉求，按天猫平台规则精准核验订单明细、物流轨迹，规避售后违规风险，通过流程精简将**单人售后处理时长降低 30%**，团队接待效率显著提升；\r\n- **知识库与话术库搭建**：梳理物流延误、产品适配、退换流程等高频售后场景，分场景撰写标准回复与多轮兜底话术；持续调优店小蜜**意图识别与自动应答逻辑**，机器人**覆盖 80% 常规重复咨询**，降低人工重复沟通成本；\r\n- **机器人效果测试迭代**：持续抽检店小蜜自动回复，从回答准确性、场景匹配度、服务语气多维度评测，记录漏答、误判等 Bad Case 并整理优化清单同步知识库，形成「用户问题收集 → 话术更新 → 线上测试 → 效果复盘」闭环；\r\n- **标准化落地与新人赋能**：输出售后话术手册与店小蜜配置操作文档，定期开展新人客服培训，统一全团队售后沟通标准与机器人使用规范，**用户满意度稳定 96% 以上**；协同运营、技术侧同步客服优化需求。\r\n\r\n---\r\n\r\n## 教育背景\r\n\r\n**闽南理工学院** ｜ 信息与计算科学 ｜ 本科 ｜ 2020.09 - 2024.06\r\n\r\n主修课程：软件工程、Python、PHP实践、数学统计等；具备数据处理、逻辑分析与基础编程能力。\r\n\r\n---\r\n\r\n## 专业技能\r\n\r\n- **智能客服系统**：精通店小蜜的配置逻辑与优化方法（知识库搭建、意图识别、多轮对话流程、自动应答调优），熟悉电商客服业务场景与天猫售后规范；\r\n- **大模型训练**：指令/问答语料构建、标注规范编写、多模态样本处理、结构化提示词工程、模型输出多维评测与迭代；\r\n- **数据分析**：Excel 数据分析、Python 数据处理，习惯以量化指标（解决率、处理时长、覆盖率、满意度）驱动运营决策，熟悉线上测试对比与复盘分析方法；\r\n- **流程自动化基础**：办公自动化技能扎实（Excel 自动化、计算机一级），理解流程梳理、规则化拆解与自动化可行性评估方法，可快速衔接 RPA 流程分析工作；\r\n- **文档与培训**：标注手册、操作文档、测试案例编写，内部培训与跨部门协同。\r\n\r\n---\r\n\r\n## 自我评价\r\n\r\n两年智能客服一线实战 + 生成式 AI 训练复合背景：既懂电商客服真实工作流与用户诉求，又掌握大模型语料构建、提示词工程与效果评测方法，能独立完成从需求分析、方案设计到落地验收、复盘迭代的全流程。注重准确性与量化结果，擅长把个人经验沉淀为手册、模板与培训体系，与「店小蜜训练师」岗位要求的 AI 训练师团队管理、知识库运营与数据驱动优化方向高度契合。\r\n";
+CUR_MD = mdEl.value;
+
+function render(){
+  var theme = document.getElementById('theme').value;
+  var zoom = parseFloat(document.getElementById('zoom').value);
+  var md = mdEl.value;
+  CUR_MD = md;
+  var stage = document.getElementById('stage');
+  stage.innerHTML = '';
+  var list = theme === 'all'
+    ? ['modern','business','elegant','ocean','vitality','jade']
+    : [theme];
+  list.forEach(function(t){
+    var wrap = document.createElement('div');
+    var lab = document.createElement('div');
+    lab.className = 'lab';
+    lab.textContent = RESUME_THEMES[t].name + '　（缩放 ' + Math.round(zoom*100) + '%）';
+    var paper = document.createElement('div');
+    paper.className = 'paper';
+    paper.innerHTML = buildResumeHTML(md, t);
+    var inner = paper.querySelector('.rs-wrap') || paper.firstElementChild;
+    inner.style.transform = 'scale(' + zoom + ')';
+    paper.style.width = (794*zoom) + 'px';
+    paper.style.height = ((inner.offsetHeight||1123)*zoom) + 'px';
+    inner.style.transformOrigin = 'top left';
+    wrap.appendChild(lab); wrap.appendChild(paper);
+    stage.appendChild(wrap);
+  });
+}
+
+/* 与脚本内同一条渲染链路：html2canvas 优先（离屏容器），失败退回 SVG foreignObject */
+function renderCanvas(t, scale){
+  var host = document.createElement('div');
+  host.style.cssText = 'position:fixed;left:-10000px;top:0;width:794px;z-index:-1;pointer-events:none;';
+  host.innerHTML = buildResumeHTML(mdEl.value, t);
+  document.body.appendChild(host);
+  var paper = host.querySelector('.rs-wrap') || host.firstElementChild;
+  function done(cv){ if (host.parentNode) host.parentNode.removeChild(host); return cv; }
+  if (typeof html2canvas === 'function') {
+    return html2canvas(paper, { scale: scale, backgroundColor: '#ffffff', width: 794, windowWidth: 794, logging: false }).then(done);
+  }
+  var h = Math.max(paper.offsetHeight || paper.scrollHeight || 1123, 700);
+  return nodeToCanvas(paper, 794, h, scale).then(done);
+}
+
+function downloadBlob(blob, name){
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+}
+
+document.getElementById('theme').onchange = render;
+document.getElementById('zoom').onchange = render;
+document.getElementById('btn-render').onclick = render;
+document.getElementById('btn-print').onclick = function(){ window.print(); };
+
+/* 「下载 PDF」：jsPDF 多页 A4 切片 → 真实 .pdf 文件；组件缺失时退回打印窗口 */
+document.getElementById('btn-pdf').onclick = function(){
+  var t = document.getElementById('theme').value === 'all' ? 'modern' : document.getElementById('theme').value;
+  var JsPDF = (window.jspdf && window.jspdf.jsPDF) ? window.jspdf.jsPDF : null;
+  if (!JsPDF) {
+    var html2 = buildPrintDocument(t, '简历-优化-' + (safeName(JD_META.title) || '岗位'));
+    var w = window.open('', '_blank');
+    if (!w) { alert('弹窗被拦截，请允许后重试'); return; }
+    w.document.open(); w.document.write(html2); w.document.close();
+    setTimeout(function(){ try{ w.focus(); w.print(); }catch(e){} }, 900);
+    return;
+  }
+  var btn = this; btn.disabled = true;
+  renderCanvas(t, 2).then(function(canvas){
+    var PW = 210;
+    var pxPerMm = canvas.width / PW;
+    var pageHpx = Math.max(1, Math.round(297 * pxPerMm));
+    var pages = Math.max(1, Math.ceil(canvas.height / pageHpx));
+    var doc = new JsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+    var slice = document.createElement('canvas');
+    var sctx = slice.getContext('2d');
+    for (var p = 0; p < pages; p++) {
+      var sy = p * pageHpx;
+      var sh = Math.min(pageHpx, canvas.height - sy);
+      slice.width = canvas.width; slice.height = sh;
+      sctx.fillStyle = '#fff'; sctx.fillRect(0, 0, slice.width, slice.height);
+      sctx.drawImage(canvas, 0, sy, canvas.width, sh, 0, 0, canvas.width, sh);
+      if (p > 0) doc.addPage();
+      doc.addImage(slice.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, PW, sh / pxPerMm, undefined, 'FAST');
+    }
+    doc.save('简历预览-' + t + '.pdf');
+    btn.disabled = false;
+  }).catch(function(e){ alert('PDF 生成失败：' + e.message); btn.disabled = false; });
+};
+
+document.getElementById('btn-png').onclick = function(){
+  var theme = document.getElementById('theme').value;
+  var t = theme === 'all' ? 'modern' : theme;
+  renderCanvas(t, 2).then(function(cv){
+    cv.toBlob(function(b){ if (b) downloadBlob(b, '简历预览-' + t + '.png'); }, 'image/png');
+  }).catch(function(e){ alert('渲染失败：' + e.message); });
+};
+
+render();
+</script>
+</body></html>

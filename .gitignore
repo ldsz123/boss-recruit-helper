@@ -24,3 +24,12 @@ node_modules/
 my-codes.txt
 codes.json
 *.codes.txt
+
+# 作者发码后台：含明文密钥与发码算法，只留在本地，切勿公开
+admin.html
+
+# 授权工具链与密钥：只在作者本地，绝不进公开仓库
+sell-kit/
+brh-private-key.json
+brh-public-key.json
+*token*.txt
