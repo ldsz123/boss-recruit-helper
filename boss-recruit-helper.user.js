@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.6.2
+// @version      1.6.3
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -60,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.2';
+  const VERSION = '1.6.3';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -286,20 +286,22 @@
    * ========================================================== */
 
   function extractJobCards() {
-    const wrappers = $$('.job-card-wrapper, .job-card-left');
-    const list = wrappers.length ? wrappers : $$('[class*="job-card"]').filter((el) => !el.parentElement || !el.parentElement.matches('[class*="job-card"]'));
+    // Boss 列表页 DOM 经常改版：多组选择器 + 去重 + 属性兜底
+    const wrappers = $$('.job-card-wrapper, .job-card-left, .job-card-body, [class*="job-card"], [class*="job-item"], [class*="job-primary"]');
     const seen = new Set();
     const jobs = [];
-    for (const w of list) {
+    for (const w of wrappers) {
       if (seen.has(w)) continue;
+      // 跳过嵌套重复（取最外层）
+      if (wrappers.some((o) => o !== w && o.contains(w))) continue;
       seen.add(w);
-      const titleEl = $('.job-name a', w) || $('a.job-name', w) || $('.job-title a', w) || $('h3 a', w) || $('a', w);
+      const titleEl = $('.job-name a', w) || $('a.job-name', w) || $('.job-title a', w) || $('h3 a', w) || $('a[href*="/job_detail/"]', w) || $('a[href*="/geek/job/"]', w) || $('a', w);
       const title = txt(titleEl).replace(/\s+/g, ' ').trim();
       if (!title || title.length < 2) continue;
-      const salary = txt($('.salary', w)) || txt($('.job-salary', w));
-      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w));
+      const salary = txt($('.salary', w)) || txt($('.job-salary', w)) || (w.innerText.match(/(\d+[Kk]?-?\d*[Kk]?)/) || [])[1] || '';
+      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w)) || txt($('.company a', w));
       const area = txt($('.job-area', w)) || txt($('.job-area-wrapper', w)) || txt($('.city', w));
-      const tags = $$('.tag-list .tag, .tag, .info-desc .tag', w).map(txt).filter(Boolean);
+      const tags = $$('.tag-list .tag, .tag, .info-desc .tag, [class*="tag"], [class*="label"]', w).map(txt).filter(Boolean).slice(0, 8);
       const desc = txt($('.job-sec-text', w)) || txt($('.info-desc', w)) || txt($('.job-desc', w));
       const link = (titleEl && titleEl.href) ? titleEl : (w.querySelector('a') || null);
       jobs.push({ el: w, title, salary, company, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
@@ -328,7 +330,7 @@
           const data = JSON.parse(res.responseText);
           const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
           if (!content || !content.trim()) throw new Error('接口未返回内容');
-          onOk(content.trim());
+          onOk(cleanText(content.trim()));
         } catch (e) { onFail(e.message); }
       },
       onerror(err) { onFail('网络错误：' + (err && err.error ? err.error : '无法连接接口')); },
@@ -348,11 +350,19 @@
     rawLLM(messages, (text) => {
       let arr = [];
       try {
-        const m = text.match(/\[[\s\S]*\]/);
+        // 清洗 + 提取 JSON 数组（兼容 markdown 代码块、前后多余文字）
+        const clean = cleanText(text).replace(/```json/g, '').replace(/```/g, '').trim();
+        const m = clean.match(/\[[\s\S]*\]/);
         if (m) arr = JSON.parse(m[0]);
       } catch (e) { arr = []; }
       if (!Array.isArray(arr) || !arr.length) { UI.showStatus('brh-match', 'AI 未返回有效结果，可改用「本地关键词」匹配', 'err'); return; }
-      onResult(arr);
+      // 规范化每条结果，防止字段缺失导致渲染异常
+      const norm = arr.map((r) => {
+        const score = Math.max(0, Math.min(100, parseInt(r.score, 10) || 0));
+        const fit = ['合适', '一般', '不太合适'].includes(r.fit) ? r.fit : (score >= 70 ? '合适' : score >= 40 ? '一般' : '不太合适');
+        return { idx: parseInt(r.idx, 10) || 0, score, fit, reason: String(r.reason || '').slice(0, 60) };
+      });
+      onResult(norm);
     }, (msg) => UI.showStatus('brh-match', '匹配失败：' + msg, 'err'));
   }
 
@@ -372,19 +382,22 @@
     const R = tokenize(resume);
     const res = [];
     jobs.forEach((j, i) => {
-      const J = tokenize(j.title + ' ' + j.tags.join(' ') + ' ' + (j.desc || ''));
-      let matched = 0;
+      // 标题权重更高（标题词命中得分×2）
+      const titleTokens = tokenize(j.title);
+      const otherTokens = tokenize(j.tags.join(' ') + ' ' + (j.desc || ''));
+      const J = new Set([...titleTokens, ...otherTokens]);
+      let matched = 0, titleHit = 0;
       const hitList = [];
-      J.forEach((t) => {
-        if (R.has(t)) {
-          matched++;
-          const v = t.startsWith('ng:') ? t.slice(3) : t;
-          if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v);
-        }
+      titleTokens.forEach((t) => {
+        if (R.has(t)) { matched += 2; titleHit++; const v = t.startsWith('ng:') ? t.slice(3) : t; if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v); }
       });
-      const cov = J.size ? matched / J.size : 0;
-      const score = Math.min(100, Math.round(cov * 130));
-      const fit = score >= 45 ? '合适' : score >= 20 ? '一般' : '不太合适';
+      otherTokens.forEach((t) => {
+        if (R.has(t) && !titleTokens.has(t)) { matched++; const v = t.startsWith('ng:') ? t.slice(3) : t; if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v); }
+      });
+      const denom = Math.max(1, titleTokens.size * 2 + otherTokens.size);
+      const cov = matched / denom;
+      const score = Math.min(100, Math.round(cov * 100));
+      const fit = score >= 50 ? '合适' : score >= 25 ? '一般' : '不太合适';
       res.push({ idx: i, score, fit, reason: hitList.length ? '命中：' + hitList.join('/') : '关键词重合少' });
     });
     return res;
@@ -2056,6 +2069,7 @@
         ${isList ? '' : '<div class="brh-tip brh-row" style="color:#f59e0b">当前不是职位列表页，可能扫描不到岗位；请打开 Boss 搜索结果列表页再试。</div>'}
         <div class="brh-row">
           <button class="brh-btn" id="brh-scan">🔍 扫描本页岗位并匹配</button>
+          <button class="brh-btn ghost sm" id="brh-match-debug">🛠 调试</button>
         </div>
         <div class="brh-seg" id="brh-mode">
           <button data-mode="ai" class="on">AI 匹配</button>
@@ -2071,6 +2085,25 @@
       const mode = { v: 'ai' };
       $$('#brh-mode button').forEach((b) => { b.onclick = () => { mode.v = b.dataset.mode; $$('#brh-mode button').forEach((x) => x.classList.toggle('on', x === b)); }; });
       const scan = $('#brh-scan'); if (scan) scan.onclick = () => runMatch(mode.v);
+      const dbg = $('#brh-match-debug'); if (dbg) dbg.onclick = () => {
+        const jobs = extractJobCards();
+        const last = getStore(STORE_KEYS.matchRes, null);
+        let html = '<div style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;margin-top:8px;font-size:12.5px;color:#cbd5e1;max-height:260px;overflow:auto">';
+        html += '<b>🛠 调试信息</b> · 扫描到 ' + jobs.length + ' 个岗位卡片<br><br>';
+        if (!jobs.length) { html += '❌ 未扫描到岗位卡片。当前选择器均未匹配。<br>请确认在 Boss <b>职位列表页</b>（搜索结果页）操作。'; }
+        else {
+          html += '<b>提取到的岗位：</b><br>';
+          jobs.forEach((j, i) => { html += (i + 1) + '. ' + (j.title || '—') + (j.salary ? ' [' + j.salary + ']' : '') + (j.company ? ' @' + j.company : '') + '<br>'; });
+          if (last && last.length) {
+            html += '<br><b>最近一次匹配结果（' + last.length + ' 条）：</b><br>';
+            last.forEach((r) => { html += '  idx' + r.idx + ' → ' + r.score + '分/' + r.fit + '：' + (r.reason || '') + '<br>'; });
+          }
+        }
+        html += '</div>';
+        const box = $('#brh-match-debug-box'); if (box) box.remove();
+        const div = document.createElement('div'); div.id = 'brh-match-debug-box'; div.innerHTML = html;
+        $('#brh-match-list').parentNode.insertBefore(div, $('#brh-match-list'));
+      };
       const og = $('#brh-only-good'); if (og) og.onclick = () => filterPage('good');
       const sa = $('#brh-show-all'); if (sa) sa.onclick = () => filterPage('all');
       if (lastRes) {
