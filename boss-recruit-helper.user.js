@@ -35,6 +35,7 @@
     cfg: 'brh_cfg',          // { baseUrl, apiKey, model }
     jd: 'brh_jd',            // 最近抓取的 JD 文本
     jdMeta: 'brh_jd_meta',   // { title, company, salary, url, time }
+    jdExplain: 'brh_jd_explain', // AI 岗位解释（缓存）
     resume: 'brh_resume',    // 用户原始简历文本
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
@@ -234,6 +235,45 @@
     const head = `【目标岗位】${jd.title}${jd.salary ? '　' + jd.salary : ''}${jd.company ? '　|　' + jd.company : ''}`;
     const body = jd.sections.map((s) => `## ${s.title}\n${s.body}`).join('\n\n');
     return `${head}\n\n${body}`;
+  }
+
+  /* ---- 岗位解释：用大白话讲清岗位做什么 / 需要什么能力 / 适合谁 / 职业方向 ---- */
+  function explainPosition() {
+    const jd = getStore(STORE_KEYS.jd, '');
+    if (!jd || jd.length < 30) { toast('请先抓取或粘贴 JD（至少 30 字）', 'err'); return; }
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    UI.showStatus('brh-jd', 'AI 正在解读岗位，请稍候…');
+    const sys = [
+      '你是一位资深职业规划师，擅长把招聘 JD 翻译成求职者能听懂的大白话。',
+      '请根据以下岗位 JD，按下面结构输出中文解读（不要 Markdown 标题，直接输出带小标题的正文）：',
+      '【岗位一句话】用一句大白话讲清这个岗位每天在做什么。',
+      '【核心职责】3~5 条，每条一句话，聚焦「做什么」而不是空话。',
+      '【硬技能要求】列出真正需要掌握的工具 / 技术 / 证书，区分「必须有」和「加分项」。',
+      '【软素质要求】沟通、抗压、协作等隐性要求，结合岗位实际场景说明。',
+      '【适合谁】什么专业 / 什么经验背景的人最匹配；转行者需要补什么。',
+      '【职业方向】做 3~5 年后可以往哪些方向走，上升空间如何。',
+      '【求职提示】针对该岗位，简历和面试最该突出的 2~3 个点。',
+      '要求：不要照抄 JD 原文，全部用自己的话说；对模糊的要求给出合理解读；总字数控制在 600~900 字；只输出解读，不要开场白和结束语。'
+    ].join('\n');
+    callLLM(
+      [{ role: 'system', content: sys }, { role: 'user', content: `${meta.title ? '【岗位名称】' + meta.title + '\n' : ''}${meta.company ? '【公司】' + meta.company + '\n' : ''}${meta.salary ? '【薪资】' + meta.salary + '\n' : ''}【岗位 JD】\n${jd}` }],
+      (content) => {
+        setStore(STORE_KEYS.jdExplain, content);
+        UI.renderJdTab();
+        UI.showStatus('brh-jd', '✅ 岗位解读已完成', 'ok');
+        toast('岗位解读完成', 'ok');
+      },
+      'brh-jd'
+    );
+  }
+
+  /* ---- 小红书搜索该岗位的真实经验帖（面经 / 薪资 / 避坑） ---- */
+  function searchXhs(title) {
+    const kw = title || getStore(STORE_KEYS.jdMeta, {}).title || '';
+    if (!kw) { toast('请先获取岗位名称', 'err'); return; }
+    const url = 'https://www.xiaohongshu.com/search_result?keyword=' + encodeURIComponent(kw + ' 岗位职责 面经 薪资') + '&source=web_search_result_notes';
+    window.open(url, '_blank');
+    toast('已打开小红书搜索：' + kw, 'ok');
   }
 
   /* ============================================================
@@ -1525,7 +1565,9 @@
     renderJdTab() {
       const body = $('#brh-body', this.root);
       const jd = getStore(STORE_KEYS.jd, '');
-      const meta = getStore(STORE_KEYS.jdMeta, {});
+      const meta = getStore(STORE_KEYS.jdMeta, '');
+      const explain = getStore(STORE_KEYS.jdExplain, '');
+      const title = meta.title || '';
       body.innerHTML = `
         <div class="brh-row">
           <button class="brh-btn" id="brh-grab">🎯 抓取本页岗位 JD</button>
@@ -1534,6 +1576,15 @@
         <div class="brh-tip brh-row" id="brh-jd-meta">${meta.title ? `已捕获：<span class="brh-chip">${esc(meta.title)}</span>${meta.salary ? `<span class="brh-chip">${esc(meta.salary)}</span>` : ''}${meta.company ? `<span class="brh-chip">${esc(meta.company)}</span>` : ''}` : '在职位详情页点击「抓取」，或在聊天页右侧岗位卡上点击后抓取；抓不到可直接在下方粘贴 JD。'}</div>
         <textarea class="brh-area" id="brh-jd-area" style="min-height:200px" placeholder="岗位职责 / 任职要求 将显示在这里，可手动编辑补充…">${esc(jd)}</textarea>
         <div class="brh-status" id="brh-jd-status"></div>
+        ${jd ? `
+        <div class="brh-row" style="margin-top:10px">
+          <button class="brh-btn ghost sm" id="brh-explain">📖 AI 岗位解释</button>
+          <button class="brh-btn ghost sm" id="brh-xhs" ${title ? '' : 'disabled title="请先抓取/粘贴 JD 获取岗位名称"'}>📕 小红书搜经验</button>
+        </div>
+        <div class="brh-status" id="brh-explain-status"></div>
+        ${explain ? `<div class="brh-row" style="margin-top:8px"><div class="brh-label">📖 岗位解读</div><div class="brh-area" id="brh-explain-area" style="min-height:120px;white-space:pre-wrap;line-height:1.8">${esc(explain)}</div>
+          <div class="brh-row" style="margin-top:6px"><button class="brh-btn ghost sm" id="brh-explain-copy">📋 复制解读</button></div></div>` : ''}
+        <div class="brh-tip">「AI 岗位解释」用大白话讲清这个岗位做什么、需要什么能力、适合谁、职业方向，帮你有针对性地优化简历。<br>「小红书搜经验」一键打开小红书搜索该岗位的真实面经 / 薪资 / 避坑经验。</div>` : ''}
       `;
       $('#brh-grab').onclick = () => {
         const r = extractJD();
@@ -1547,11 +1598,21 @@
         this.showStatus('brh-jd', `✅ 已捕获 ${r.sections.length} 个板块（${nowStr()}）`, 'ok');
         toast('JD 抓取成功', 'ok');
       };
-      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); this.renderJdTab(); };
+      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); setStore(STORE_KEYS.jdExplain, ''); this.renderJdTab(); };
       $('#brh-jd-area').addEventListener('change', (e) => {
         setStore(STORE_KEYS.jd, e.target.value);
         this.showStatus('brh-jd', '已保存手动编辑', 'ok');
       });
+      const explainBtn = $('#brh-explain');
+      if (explainBtn) explainBtn.onclick = () => explainPosition();
+      const xhsBtn = $('#brh-xhs');
+      if (xhsBtn) xhsBtn.onclick = () => searchXhs(title);
+      const explainCopy = $('#brh-explain-copy');
+      if (explainCopy) explainCopy.onclick = () => {
+        const v = getStore(STORE_KEYS.jdExplain, '');
+        if (!v) { toast('暂无解读', 'err'); return; }
+        navigator.clipboard.writeText(v).then(() => toast('岗位解读已复制', 'ok'), () => toast('复制失败', 'err'));
+      };
     },
 
     /* ---- 简历页 ---- */
