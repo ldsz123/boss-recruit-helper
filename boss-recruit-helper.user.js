@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.6.3
+// @version      1.6.0
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -35,12 +35,9 @@
     cfg: 'brh_cfg',          // { baseUrl, apiKey, model }
     jd: 'brh_jd',            // 最近抓取的 JD 文本
     jdMeta: 'brh_jd_meta',   // { title, company, salary, url, time }
-    jdExplain: 'brh_jd_explain', // AI 岗位解释（缓存）
     resume: 'brh_resume',    // 用户原始简历文本
-    resumeLibrary: 'brh_resume_lib', // 简历库：按岗位分类的简历 { categories: [{name, items:[{name,text,title}]}] }
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
-    greetingFor: 'brh_greeting_for', // 该话术对应的岗位名（用于 UI 提示）
     hrQuestion: 'brh_hr_question', // 最近一次 HR 提问（智能回复用）
     hrReply: 'brh_hr_reply',    // 最近一次生成的 HR 回复
     greetingTpl: 'brh_greeting_tpl',        // 当前选中的话术模板 id
@@ -60,7 +57,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.3';
+  const VERSION = '1.6.0';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -121,10 +118,7 @@
       cursor: move; user-select: none; }
     .brh-header b { flex: 1; font-size: 14px; }
     .brh-header .brh-min { cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; opacity: .9; }
-    .brh-lib-cat-name{ font-size:13.5px;color:#cbd5e1;padding:6px 0;border-bottom:1px solid #e2e8f0;margin-bottom:4px }
-  .brh-lib-item{ display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;background:#f8fafc;margin:3px 0;border:1px solid #e2e8f0;font-size:13px;color:#334155 }
-  .brh-lib-item:hover{ background:#eef2f7;border-color:#2563eb }
-  .brh-lib-item span:nth-child(2){ flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
+    .brh-tabs { display: flex; border-bottom: 1px solid #ebeef5; }
     .brh-tabs .brh-tab { flex: 1; text-align: center; padding: 8px 0; cursor: pointer;
       color: #909399; border-bottom: 2px solid transparent; }
     .brh-tabs .brh-tab.on { color: #00a1ea; border-bottom-color: #00a1ea; font-weight: 600; }
@@ -242,66 +236,25 @@
     return `${head}\n\n${body}`;
   }
 
-  /* ---- 岗位解释：用大白话讲清岗位做什么 / 需要什么能力 / 适合谁 / 职业方向 ---- */
-  function explainPosition() {
-    const jd = getStore(STORE_KEYS.jd, '');
-    if (!jd || jd.length < 30) { toast('请先抓取或粘贴 JD（至少 30 字）', 'err'); return; }
-    const meta = getStore(STORE_KEYS.jdMeta, {});
-    UI.showStatus('brh-jd', 'AI 正在解读岗位，请稍候…');
-    const sys = [
-      '你是一位资深职业规划师，擅长把招聘 JD 翻译成求职者能听懂的大白话。',
-      '请根据以下岗位 JD，按下面结构输出中文解读（不要 Markdown 标题，直接输出带小标题的正文）：',
-      '【岗位一句话】用一句大白话讲清这个岗位每天在做什么。',
-      '【核心职责】3~5 条，每条一句话，聚焦「做什么」而不是空话。',
-      '【硬技能要求】列出真正需要掌握的工具 / 技术 / 证书，区分「必须有」和「加分项」。',
-      '【软素质要求】沟通、抗压、协作等隐性要求，结合岗位实际场景说明。',
-      '【适合谁】什么专业 / 什么经验背景的人最匹配；转行者需要补什么。',
-      '【职业方向】做 3~5 年后可以往哪些方向走，上升空间如何。',
-      '【求职提示】针对该岗位，简历和面试最该突出的 2~3 个点。',
-      '要求：不要照抄 JD 原文，全部用自己的话说；对模糊的要求给出合理解读；总字数控制在 600~900 字；只输出解读，不要开场白和结束语。'
-    ].join('\n');
-    callLLM(
-      [{ role: 'system', content: sys }, { role: 'user', content: `${meta.title ? '【岗位名称】' + meta.title + '\n' : ''}${meta.company ? '【公司】' + meta.company + '\n' : ''}${meta.salary ? '【薪资】' + meta.salary + '\n' : ''}【岗位 JD】\n${jd}` }],
-      (content) => {
-        setStore(STORE_KEYS.jdExplain, content);
-        UI.renderJdTab();
-        UI.showStatus('brh-jd', '✅ 岗位解读已完成', 'ok');
-        toast('岗位解读完成', 'ok');
-      },
-      'brh-jd'
-    );
-  }
-
-  /* ---- 小红书搜索该岗位的真实经验帖（面经 / 薪资 / 避坑） ---- */
-  function searchXhs(title) {
-    const kw = title || getStore(STORE_KEYS.jdMeta, {}).title || '';
-    if (!kw) { toast('请先获取岗位名称', 'err'); return; }
-    const url = 'https://www.xiaohongshu.com/search_result?keyword=' + encodeURIComponent(kw + ' 岗位职责 面经 薪资') + '&source=web_search_result_notes';
-    window.open(url, '_blank');
-    toast('已打开小红书搜索：' + kw, 'ok');
-  }
-
   /* ============================================================
    * 2.5 选岗匹配（扫描本页岗位 + AI/本地匹配 + 应用）
    * ========================================================== */
 
   function extractJobCards() {
-    // Boss 列表页 DOM 经常改版：多组选择器 + 去重 + 属性兜底
-    const wrappers = $$('.job-card-wrapper, .job-card-left, .job-card-body, [class*="job-card"], [class*="job-item"], [class*="job-primary"]');
+    const wrappers = $$('.job-card-wrapper, .job-card-left');
+    const list = wrappers.length ? wrappers : $$('[class*="job-card"]').filter((el) => !el.parentElement || !el.parentElement.matches('[class*="job-card"]'));
     const seen = new Set();
     const jobs = [];
-    for (const w of wrappers) {
+    for (const w of list) {
       if (seen.has(w)) continue;
-      // 跳过嵌套重复（取最外层）
-      if (wrappers.some((o) => o !== w && o.contains(w))) continue;
       seen.add(w);
-      const titleEl = $('.job-name a', w) || $('a.job-name', w) || $('.job-title a', w) || $('h3 a', w) || $('a[href*="/job_detail/"]', w) || $('a[href*="/geek/job/"]', w) || $('a', w);
+      const titleEl = $('.job-name a', w) || $('a.job-name', w) || $('.job-title a', w) || $('h3 a', w) || $('a', w);
       const title = txt(titleEl).replace(/\s+/g, ' ').trim();
       if (!title || title.length < 2) continue;
-      const salary = txt($('.salary', w)) || txt($('.job-salary', w)) || (w.innerText.match(/(\d+[Kk]?-?\d*[Kk]?)/) || [])[1] || '';
-      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w)) || txt($('.company a', w));
+      const salary = txt($('.salary', w)) || txt($('.job-salary', w));
+      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w));
       const area = txt($('.job-area', w)) || txt($('.job-area-wrapper', w)) || txt($('.city', w));
-      const tags = $$('.tag-list .tag, .tag, .info-desc .tag, [class*="tag"], [class*="label"]', w).map(txt).filter(Boolean).slice(0, 8);
+      const tags = $$('.tag-list .tag, .tag, .info-desc .tag', w).map(txt).filter(Boolean);
       const desc = txt($('.job-sec-text', w)) || txt($('.info-desc', w)) || txt($('.job-desc', w));
       const link = (titleEl && titleEl.href) ? titleEl : (w.querySelector('a') || null);
       jobs.push({ el: w, title, salary, company, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
@@ -330,7 +283,7 @@
           const data = JSON.parse(res.responseText);
           const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
           if (!content || !content.trim()) throw new Error('接口未返回内容');
-          onOk(cleanText(content.trim()));
+          onOk(content.trim());
         } catch (e) { onFail(e.message); }
       },
       onerror(err) { onFail('网络错误：' + (err && err.error ? err.error : '无法连接接口')); },
@@ -350,19 +303,11 @@
     rawLLM(messages, (text) => {
       let arr = [];
       try {
-        // 清洗 + 提取 JSON 数组（兼容 markdown 代码块、前后多余文字）
-        const clean = cleanText(text).replace(/```json/g, '').replace(/```/g, '').trim();
-        const m = clean.match(/\[[\s\S]*\]/);
+        const m = text.match(/\[[\s\S]*\]/);
         if (m) arr = JSON.parse(m[0]);
       } catch (e) { arr = []; }
       if (!Array.isArray(arr) || !arr.length) { UI.showStatus('brh-match', 'AI 未返回有效结果，可改用「本地关键词」匹配', 'err'); return; }
-      // 规范化每条结果，防止字段缺失导致渲染异常
-      const norm = arr.map((r) => {
-        const score = Math.max(0, Math.min(100, parseInt(r.score, 10) || 0));
-        const fit = ['合适', '一般', '不太合适'].includes(r.fit) ? r.fit : (score >= 70 ? '合适' : score >= 40 ? '一般' : '不太合适');
-        return { idx: parseInt(r.idx, 10) || 0, score, fit, reason: String(r.reason || '').slice(0, 60) };
-      });
-      onResult(norm);
+      onResult(arr);
     }, (msg) => UI.showStatus('brh-match', '匹配失败：' + msg, 'err'));
   }
 
@@ -382,22 +327,19 @@
     const R = tokenize(resume);
     const res = [];
     jobs.forEach((j, i) => {
-      // 标题权重更高（标题词命中得分×2）
-      const titleTokens = tokenize(j.title);
-      const otherTokens = tokenize(j.tags.join(' ') + ' ' + (j.desc || ''));
-      const J = new Set([...titleTokens, ...otherTokens]);
-      let matched = 0, titleHit = 0;
+      const J = tokenize(j.title + ' ' + j.tags.join(' ') + ' ' + (j.desc || ''));
+      let matched = 0;
       const hitList = [];
-      titleTokens.forEach((t) => {
-        if (R.has(t)) { matched += 2; titleHit++; const v = t.startsWith('ng:') ? t.slice(3) : t; if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v); }
+      J.forEach((t) => {
+        if (R.has(t)) {
+          matched++;
+          const v = t.startsWith('ng:') ? t.slice(3) : t;
+          if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v);
+        }
       });
-      otherTokens.forEach((t) => {
-        if (R.has(t) && !titleTokens.has(t)) { matched++; const v = t.startsWith('ng:') ? t.slice(3) : t; if (v.length >= 2 && hitList.length < 4 && !hitList.includes(v)) hitList.push(v); }
-      });
-      const denom = Math.max(1, titleTokens.size * 2 + otherTokens.size);
-      const cov = matched / denom;
-      const score = Math.min(100, Math.round(cov * 100));
-      const fit = score >= 50 ? '合适' : score >= 25 ? '一般' : '不太合适';
+      const cov = J.size ? matched / J.size : 0;
+      const score = Math.min(100, Math.round(cov * 130));
+      const fit = score >= 45 ? '合适' : score >= 20 ? '一般' : '不太合适';
       res.push({ idx: i, score, fit, reason: hitList.length ? '命中：' + hitList.join('/') : '关键词重合少' });
     });
     return res;
@@ -528,7 +470,7 @@
           text += content.items.map((it) => it.str || '').join(' ') + '\n';
         }
         if (!text.trim()) throw new Error('PDF 未提取到文字（可能是扫描件/图片型）');
-        return cleanText(text.trim());
+        return text.trim();
       } catch (e) { throw new Error('PDF 解析失败：' + e.message); }
     }
     if (name.endsWith('.docx')) {
@@ -547,137 +489,8 @@
   }
 
   /* ============================================================
-   * 2.8 简历库：扫描文件夹 / 多选 PDF → AI 按岗位分类
-   * ========================================================== */
-
-  // 从单个 File 对象提取文本（复用 parseResumeFile 的逻辑，但返回 {name, text}）
-  async function extractPdfText(file) {
-    const text = await parseResumeFile(file);
-    return { name: file.name || '未命名', text: text.trim() };
-  }
-
-  // 递归扫描文件夹里的 PDF（File System Access API）
-  async function scanPdfFilesInDir(dirHandle, out, depth) {
-    depth = depth || 0;
-    if (depth > 4) return; // 最多 4 层子目录，避免过深
-    try {
-      for await (const entry of dirHandle.values()) {
-        if (entry.kind === 'file' && (entry.name || '').toLowerCase().endsWith('.pdf')) {
-          try {
-            const file = await entry.getFile();
-            out.push(file);
-          } catch (e) { /* 跳过读不到的文件 */ }
-        } else if (entry.kind === 'directory' && depth < 4) {
-          await scanPdfFilesInDir(entry, out, depth + 1);
-        }
-      }
-    } catch (e) { /* 权限不足等 */ }
-  }
-
-  // AI 批量分类：把多份简历归纳为按岗位分的类别
-  // items: [{name, text}]  →  return [{category, items:[{name, title, text}]}]
-  async function aiCategorizeResumes(items, onProgress, onDone) {
-    // 先各自提取「文件名 + 前 150 字」作为摘要，减少 token
-    const summaries = items.map((it, i) => ({
-      i, name: it.name,
-      snippet: (it.text || '').replace(/\s+/g, ' ').slice(0, 150)
-    }));
-    const sys = [
-      '你是简历分类专家。下面给出若干份简历的文件名与开头摘要，请完成：',
-      '1. 按「岗位」把简历归到不同类别（如「Java 后端」「前端」「产品运营」「UI 设计」「数据分析」「行政人事」「销售」「财务」等，按实际内容判断，不要强行归入不相关的类）；',
-      '2. 每份简历提取一个「岗位标题」（12 字内，如「Java 后端工程师」），依据是简历中最匹配的岗位方向；',
-      '3. 只输出 JSON，不要任何解释，格式：{"categories":[{"category":"类别名","items":[{"i":序号,"title":"岗位标题"}]}]}',
-      '要求：类别数 1~8 个；每份简历只归到一个类；类别名用 4~8 个字的中文。'
-    ].join('\n');
-    const user = '【简历列表】\n' + summaries.map((s) => `${s.i}. ${s.name}：${s.snippet}`).join('\n');
-
-    callLLM(
-      [{ role: 'system', content: sys }, { role: 'user', content: user }],
-      (content) => {
-        let result;
-        try {
-          const m = content.match(/\{[\s\S]*\}/);
-          result = JSON.parse(m ? m[0] : content);
-        } catch (e) { result = null; }
-        if (!result || !result.categories) {
-          // 解析失败兜底：全归到一个「未分类」
-          result = { categories: [{ category: '未分类简历', items: items.map((it, i) => ({ i, title: it.name.replace(/\.pdf$/i, '') })) }] };
-        }
-        // 把 i 映射回完整的 name/text
-        const byIdx = {};
-        items.forEach((it, i) => { byIdx[i] = it; });
-        const categories = result.categories.map((c) => ({
-          category: c.category,
-          items: (c.items || []).map((r) => {
-            const src = byIdx[r.i];
-            return { name: src ? src.name : (r.name || '未知'), title: (r.title || (src && src.name.replace(/\.pdf$/i, '')) || '未知'), text: src ? src.text : '' };
-          }).filter((x) => x.text)
-        })).filter((c) => c.items.length);
-        onDone(categories);
-      },
-      'brh-lib'
-    );
-  }
-
-  /* ============================================================
    * 3. LLM 调用（OpenAI 兼容 /chat/completions）
    * ========================================================== */
-
-  // 入口：扫描文件夹（File System Access API，不支持时降级为多选）
-  async function scanResumeFolder(statusCb) {
-    statusCb = statusCb || function () {};
-    if (!('showDirectoryPicker' in window)) {
-      statusCb('当前浏览器不支持文件夹选择，请使用「多选 PDF」');
-      toast('请改用「多选 PDF」方式', 'err');
-      return;
-    }
-    let dirHandle;
-    try {
-      dirHandle = await window.showDirectoryPicker({ mode: 'read' });
-    } catch (e) {
-      if (e && e.name === 'AbortError') return;
-      statusCb('未选择文件夹：' + (e && e.message || e));
-      return;
-    }
-    statusCb('正在扫描「' + dirHandle.name + '」…');
-    const pdfs = [];
-    await scanPdfFilesInDir(dirHandle, pdfs, 0);
-    if (!pdfs.length) { statusCb('该文件夹（含子目录）未找到 PDF 文件'); toast('未找到 PDF', 'err'); return; }
-    statusCb('找到 ' + pdfs.length + ' 份 PDF，正在解析…');
-    await handlePickedFiles(pdfs, statusCb);
-  }
-
-  // 入口：处理一批 PDF 文件（解析 → AI 分类 → 入库）
-  async function handlePickedFiles(files, statusCb) {
-    statusCb = statusCb || function () {};
-    if (!files || !files.length) { statusCb('未收到文件'); return; }
-    const total = files.length;
-    statusCb('解析第 1/' + total + ' 份…');
-    const items = [];
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      try {
-        const r = await extractPdfText(f);
-        if (r.text) items.push({ name: r.name, text: r.text });
-        statusCb('解析第 ' + (i + 1) + '/' + total + ' 份…（' + items.length + ' 份有效）');
-      } catch (e) {
-        statusCb('跳过 ' + (f.name || '未命名') + '：' + (e && e.message || e));
-      }
-    }
-    if (!items.length) { statusCb('没有可识别的 PDF（可能是扫描件或图片型）'); toast('解析失败', 'err'); return; }
-    statusCb('AI 正在按岗位分类（共 ' + items.length + ' 份）…');
-    await new Promise((resolve) => {
-      aiCategorizeResumes(items, statusCb, (categories) => {
-        const lib = { categories, updated: Date.now() };
-        setStore(STORE_KEYS.resumeLibrary, lib);
-        UI.renderResumeTab();
-        const catCount = categories.length;
-        statusCb('✅ 完成：' + catCount + ' 个岗位类别，共 ' + items.length + ' 份简历');
-        toast('已分类 ' + items.length + ' 份到 ' + catCount + ' 个岗位', 'ok');
-        resolve();
-      });
-    });
-  }
 
   function callLLM(messages, onDone, statusKey) {
     const sk = statusKey || '优化状态';
@@ -712,7 +525,7 @@
           const data = JSON.parse(res.responseText);
           const content = data.choices?.[0]?.message?.content?.trim();
           if (!content) throw new Error('接口未返回内容');
-          onDone(cleanText(content));
+          onDone(content);
         } catch (e) {
           UI.showStatus(sk, '调用失败：' + e.message, 'err');
         }
@@ -787,22 +600,8 @@
 
   function generateGreeting(opts) {
     opts = opts || {};
-
-    // 关键修复：生成话术前，优先从当前页面重新提取 JD，确保话术对应当前岗位
-    // （避免用户换了岗位页面但存储的 JD 仍是旧岗位，导致话术按第一个岗位生成）
-    let jd = getStore(STORE_KEYS.jd, '');
-    let meta = getStore(STORE_KEYS.jdMeta, {});
-    if (/\/job_detail|\/geek\/job\//.test(location.pathname)) {
-      const fresh = extractJD();
-      if (fresh && (fresh.sections.length || fresh.title)) {
-        jd = jdToText(fresh);
-        meta = { title: fresh.title, company: fresh.company, salary: fresh.salary, url: location.href, time: nowStr() };
-        setStore(STORE_KEYS.jd, jd);
-        setStore(STORE_KEYS.jdMeta, meta);
-        UI.showJdMeta(meta);
-      }
-    }
-
+    const jd = getStore(STORE_KEYS.jd, '');
+    const resume = getStore(STORE_KEYS.resume, '');
     if (!jd || jd.length < 30) {
       if (!opts.silent) { toast('请先抓取 JD', 'err'); UI.switchTab('jd'); }
       return;
@@ -811,16 +610,15 @@
     const sys = fillTemplate(tpl.prompt, jd);
     const messages = [
       { role: 'system', content: sys },
-      { role: 'user', content: `${jd}\n\n【我的简历】\n${getStore(STORE_KEYS.resume, '') || '（未提供，请根据岗位写通用话术，留出可替换的经历占位）'}` }
+      { role: 'user', content: `${jd}\n\n【我的简历】\n${resume || '（未提供，请根据岗位写通用话术，留出可替换的经历占位）'}` }
     ];
-    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在生成「' + (meta.title || '当前岗位') + '」的打招呼话术…');
+    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在生成打招呼话术…');
     callLLM(messages, (content) => {
       setStore(STORE_KEYS.greeting, content);
-      setStore(STORE_KEYS.greetingFor, meta.title || ''); // 记录该话术对应哪个岗位，供 UI 展示
       if (!opts.silent) {
         UI.renderGreeting(content);
-        UI.showStatus('brh-chat', '✅ 「' + (meta.title || '当前岗位') + '」话术已生成，可直接填入聊天框', 'ok');
-        toast('「' + (meta.title || '当前岗位') + '」话术已生成', 'ok');
+        UI.showStatus('brh-chat', '✅ 话术已生成，可直接填入聊天框', 'ok');
+        toast('话术已生成', 'ok');
       }
       // 若优化页正打开，刷新其话术区块
       const ga = $('#brh-opt-greet');
@@ -830,109 +628,28 @@
 
   /* ---- HR 智能回复：抓取 HR 最新提问 → 结合优化简历与 JD 生成针对性回复 ---- */
 
-  // 自己发出的消息常见 class（用于排除）
-  const SELF_MSG_RE = /self|mine|right|my-msg|my-message|is-me|me-item|own|sender-me/i;
-
-  // 一条「像提问」的气泡：含问号或常见疑问词
-  function looksLikeQuestion(t) {
-    return /[?？]|\b(请问|多大|多久|什么时候|为什么|是否|能不能|可以吗|方便|期望|考虑|有没有|能不能|哪方面|到岗|离职|薪资|薪资期望|经历|经验|项目|介绍|反问|对吧|呢|吗|吧)\b/.test(t);
-  }
-
-  // 超宽泛多策略抓取 HR 最新提问：返回 { text, debug }
+  // 从聊天窗口抓取 HR 的最新消息（Boss 消息 DOM 无稳定 class，做多选择器 + 关键词兜底）
   function extractHrQuestion() {
-    const debug = [];
-    const candidates = [];
-
-    // 策略 1：用具体 class 选择器（Boss 各版本常见）
-    const selectors = [
+    const candidates = [
       '.im-list .im-item .im-msg-left',
-      '.im-list .im-item:not(.im-msg-right) .im-msg',
-      '.im-msg-left',
-      '.msg-left',
-      '.chat-message.left .message-content',
-      '.chat-message:not(.right):not(.self) .msg-text',
-      '.message-list .left .msg-content',
-      '.message-item:not(.self):not(.mine) .message-content',
-      '.msg-item.left .msg-text',
-      '.im-item .message-content',
+      '.im-item .msg-left',
+      '.chat-message .msg-left',
+      '.message-list .left',
       '[class*="msg-left"]',
-      '[class*="message"][class*="left"]',
-      '.chat-msg .msg-text'
+      '[class*="im-msg-left"]'
     ];
-    for (const sel of selectors) {
-      try {
-        const els = $$(sel);
-        for (const el of els) {
-          const t = txt(el);
-          if (t && t.length > 3 && t.length < 800) candidates.push(t);
-        }
-        if (els.length) debug.push(`${sel} → ${els.length} 个`);
-      } catch (e) {}
-    }
-
-    // 策略 2：找消息容器，按 class 区分自己/对方
-    if (!candidates.length) {
-      const containers = [
-        '.im-list', '.message-list', '.chat-message-list', '.msg-list',
-        '.chat-content', '.im-chat', '.chat-list', '[class*="message-list"]',
-        '[class*="chat-content"]', '[class*="msg-list"]'
-      ];
-      for (const cSel of containers) {
-        const c = $(cSel);
-        if (!c) continue;
-        // 取容器内所有直接文字节点
-        const walker = document.createTreeWalker(c, NodeFilter.SHOW_TEXT, null);
-        const texts = [];
-        let node;
-        while ((node = walker.nextNode())) {
-          const t = (node.textContent || '').trim();
-          if (t && t.length > 3 && t.length < 800) {
-            const p = node.parentElement;
-            const cls = p ? (p.className + ' ' + (p.parentElement ? p.parentElement.className : '')) : '';
-            const mine = SELF_MSG_RE.test(cls);
-            if (!mine) texts.push(t);
-          }
-        }
-        if (texts.length) {
-          candidates.push(...texts);
-          debug.push(`遍历 ${cSel} → 对方 ${texts.length} 条`);
-          break;
-        }
-      }
-    }
-
-    // 策略 3：终极兜底 —— 扫所有可见文字，取「像提问」的块
-    if (!candidates.length) {
-      const blocks = document.querySelectorAll('div, span, p');
-      for (const el of blocks) {
-        // 只取叶子-ish 的短文本
-        if (el.children.length > 3) continue;
-        const t = txt(el);
-        if (t && t.length > 8 && t.length < 500 && looksLikeQuestion(t)) {
-          const cls = el.className || '';
-          if (!SELF_MSG_RE.test(cls) && !/[时间戳|time|date|status]/.test(cls)) {
-            candidates.push(t);
-          }
-        }
-      }
-      if (candidates.length) debug.push(`全文兜底 → ${candidates.length} 条`);
-    }
-
-    // 从候选里挑「最像提问」的；同等条件下取最后出现的（更新的）
     let best = '';
-    let bestScore = -1;
-    for (let i = 0; i < candidates.length; i++) {
-      const t = candidates[i];
-      let score = 0;
-      if (/[?？]/.test(t)) score += 10;
-      if (looksLikeQuestion(t)) score += 5;
-      score += Math.min(t.length / 50, 4);     // 稍长一点的优先
-      // 位置靠后（更新）的微量加分
-      score += i / candidates.length;
-      if (score > bestScore) { bestScore = score; best = t; }
+    for (const sel of candidates) {
+      $$(sel).forEach((el) => {
+        const t = txt(el);
+        // 只要像「提问」的气泡：含问号/疑问词，或明显长于寒暄
+        if (t && t.length > 4 && t.length < 500 && /[?？]|请教|了解|方便|期望|考虑|为什么|多久|薪资|经验|介绍|到岗|住址|离职|加班/.test(t)) {
+          if (t.length >= best.length) best = t;
+        }
+      });
+      if (best) break;
     }
-
-    return { text: best, debug: debug.join(' | ') };
+    return best;
   }
 
   function generateHrReply(opts = {}) {
@@ -940,15 +657,10 @@
     if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
     const jd = getStore(STORE_KEYS.jd, '');
     const manual = opts.manual || '';
-    const picked = extractHrQuestion();
-    let question = manual || picked.text;
-    // 反馈抓到了什么（方便用户确认 / 排查）
-    if (!manual && picked.debug && question) {
-      toast(`🎯 已识别 HR 提问（${picked.debug.split('→').pop()?.trim() || '匹配'}）`, 'ok');
-    }
+    let question = manual || extractHrQuestion();
     if (!question) {
       // 页面上抓不到 → 让用户手动粘贴 HR 的问题
-      const v = prompt(`未在当前页面识别到 HR 的新提问。\n\n调试信息：${picked.debug || '无匹配选择器'}\n\n请把 HR 的问题复制粘贴到这里（留空取消）：`, getStore(STORE_KEYS.hrQuestion, ''));
+      const v = prompt('未在当前页面识别到 HR 的新提问。\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
       if (!v || !v.trim()) return;
       question = v.trim();
     }
@@ -1071,15 +783,6 @@
     return String(s || '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-  }
-
-  /* 清洗文本：去掉零宽字符、BOM、非法 Unicode 替换符（常用于修复「乱码」） */
-  function cleanText(s) {
-    return String(s || '')
-      .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')   // 零宽字符 / BOM / 软连字符
-      .replace(/\uFFFD/g, '')                         // Unicode 替换符 �
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')   // 控制字符（保留 \t \n \r）
-      .trim();
   }
 
   // 把优化后的 Markdown 解析成结构化数据（姓名 / 求职意向 / 分区）
@@ -1732,22 +1435,11 @@
       if (type === 'err') toast(msg, 'err');
     },
 
-    /* ---- 刷新 JD 页岗位信息条（生成话术后用于同步岗位名） ---- */
-    showJdMeta(meta) {
-      const el = $('#brh-jd-meta');
-      if (!el || !meta || !meta.title) return;
-      el.innerHTML = '已捕获：<span class="brh-chip">' + esc(meta.title) + '</span>' +
-        (meta.salary ? '<span class="brh-chip">' + esc(meta.salary) + '</span>' : '') +
-        (meta.company ? '<span class="brh-chip">' + esc(meta.company) + '</span>' : '');
-    },
-
     /* ---- JD 页 ---- */
     renderJdTab() {
       const body = $('#brh-body', this.root);
       const jd = getStore(STORE_KEYS.jd, '');
-      const meta = getStore(STORE_KEYS.jdMeta, '');
-      const explain = getStore(STORE_KEYS.jdExplain, '');
-      const title = meta.title || '';
+      const meta = getStore(STORE_KEYS.jdMeta, {});
       body.innerHTML = `
         <div class="brh-row">
           <button class="brh-btn" id="brh-grab">🎯 抓取本页岗位 JD</button>
@@ -1756,15 +1448,6 @@
         <div class="brh-tip brh-row" id="brh-jd-meta">${meta.title ? `已捕获：<span class="brh-chip">${esc(meta.title)}</span>${meta.salary ? `<span class="brh-chip">${esc(meta.salary)}</span>` : ''}${meta.company ? `<span class="brh-chip">${esc(meta.company)}</span>` : ''}` : '在职位详情页点击「抓取」，或在聊天页右侧岗位卡上点击后抓取；抓不到可直接在下方粘贴 JD。'}</div>
         <textarea class="brh-area" id="brh-jd-area" style="min-height:200px" placeholder="岗位职责 / 任职要求 将显示在这里，可手动编辑补充…">${esc(jd)}</textarea>
         <div class="brh-status" id="brh-jd-status"></div>
-        ${jd ? `
-        <div class="brh-row" style="margin-top:10px">
-          <button class="brh-btn ghost sm" id="brh-explain">📖 AI 岗位解释</button>
-          <button class="brh-btn ghost sm" id="brh-xhs" ${title ? '' : 'disabled title="请先抓取/粘贴 JD 获取岗位名称"'}>📕 小红书搜经验</button>
-        </div>
-        <div class="brh-status" id="brh-explain-status"></div>
-        ${explain ? `<div class="brh-row" style="margin-top:8px"><div class="brh-label">📖 岗位解读</div><div class="brh-area" id="brh-explain-area" style="min-height:120px;white-space:pre-wrap;line-height:1.8">${esc(explain)}</div>
-          <div class="brh-row" style="margin-top:6px"><button class="brh-btn ghost sm" id="brh-explain-copy">📋 复制解读</button></div></div>` : ''}
-        <div class="brh-tip">「AI 岗位解释」用大白话讲清这个岗位做什么、需要什么能力、适合谁、职业方向，帮你有针对性地优化简历。<br>「小红书搜经验」一键打开小红书搜索该岗位的真实面经 / 薪资 / 避坑经验。</div>` : ''}
       `;
       $('#brh-grab').onclick = () => {
         const r = extractJD();
@@ -1778,29 +1461,17 @@
         this.showStatus('brh-jd', `✅ 已捕获 ${r.sections.length} 个板块（${nowStr()}）`, 'ok');
         toast('JD 抓取成功', 'ok');
       };
-      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); setStore(STORE_KEYS.jdExplain, ''); this.renderJdTab(); };
+      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); this.renderJdTab(); };
       $('#brh-jd-area').addEventListener('change', (e) => {
         setStore(STORE_KEYS.jd, e.target.value);
         this.showStatus('brh-jd', '已保存手动编辑', 'ok');
       });
-      const explainBtn = $('#brh-explain');
-      if (explainBtn) explainBtn.onclick = () => explainPosition();
-      const xhsBtn = $('#brh-xhs');
-      if (xhsBtn) xhsBtn.onclick = () => searchXhs(title);
-      const explainCopy = $('#brh-explain-copy');
-      if (explainCopy) explainCopy.onclick = () => {
-        const v = getStore(STORE_KEYS.jdExplain, '');
-        if (!v) { toast('暂无解读', 'err'); return; }
-        navigator.clipboard.writeText(v).then(() => toast('岗位解读已复制', 'ok'), () => toast('复制失败', 'err'));
-      };
     },
 
     /* ---- 简历页 ---- */
     renderResumeTab() {
       const body = $('#brh-body', this.root);
       const resume = getStore(STORE_KEYS.resume, '');
-      const lib = getStore(STORE_KEYS.resumeLibrary, null);
-      const cats = (lib && lib.categories) ? lib.categories : [];
       body.innerHTML = `
         <div class="brh-row">
           <label class="brh-btn green" style="cursor:pointer">📎 上传简历（PDF / Word / TXT / MD）
@@ -1808,28 +1479,8 @@
           </label>
         </div>
         <div class="brh-tip brh-row">支持 PDF、Word(.docx)、TXT、MD。老版 .doc 暂不支持（请另存为 .docx 或 PDF）。解析全程在本地浏览器完成，不上传任何服务器。</div>
-        <textarea class="brh-area" id="brh-resume-area" style="min-height:160px" placeholder="粘贴或上传你的简历全文（教育背景、工作经历、项目经历、技能…）">${esc(resume)}</textarea>
+        <textarea class="brh-area" id="brh-resume-area" style="min-height:220px" placeholder="粘贴或上传你的简历全文（教育背景、工作经历、项目经历、技能…）">${esc(resume)}</textarea>
         <div class="brh-status" id="brh-resume-status">${resume ? '已有简历 ' + resume.length + ' 字' : ''}</div>
-
-        <div class="brh-row" style="margin-top:12px">
-          <button class="brh-btn ghost sm" id="brh-scan-dir">📁 扫描文件夹</button>
-          <button class="brh-btn ghost sm" id="brh-multi-pdf">📎 多选 PDF</button>
-          ${cats.length ? '<button class="brh-btn ghost sm" id="brh-clear-lib">🗑 清空库</button>' : ''}
-        </div>
-        <input type="file" id="brh-multi-input" accept=".pdf,application/pdf" multiple style="display:none">
-        <div class="brh-status" id="brh-lib-status"></div>
-        ${cats.length ? `<div class="brh-row" style="margin-top:10px"><div class="brh-label">📚 简历库 <span class="brh-chip">${cats.length} 个岗位 · ${cats.reduce((a,c)=>a+c.items.length,0)} 份</span></div></div>
-          <div id="brh-lib-list">${cats.map((c)=>`
-            <div class="brh-lib-cat" style="margin-top:10px">
-              <div class="brh-lib-cat-name"><b>📂 ${esc(c.category)}</b> <span style="color:#64748b;font-size:12px">(${c.items.length} 份)</span></div>
-              ${c.items.map((it)=>`<div class="brh-lib-item" title="${esc(it.name)}" data-lib="${esc(it.name)}">
-                <span>📄 ${esc(it.title || it.name)}</span>
-                <span style="font-size:11px;color:#64748b">${esc(it.name)}</span>
-                <button class="brh-btn ghost sm brh-lib-use" style="margin-left:auto">使用</button>
-              </div>`).join('')}
-            </div>`).join('')}
-          </div>
-          <div class="brh-tip">AI 已按岗位把简历分好类。点「使用」加载到上方文本框 → 再去 Boss 页面上传该岗位（需手动操作）。</div>` : '<div class="brh-tip">📁 扫描电脑文件夹里的 PDF（自动递归子目录）或 📎 多选 PDF，AI 会按岗位自动分类整理。'}
       `;
       $('#brh-resume-file').addEventListener('change', async (e) => {
         const f = e.target.files[0];
@@ -1847,38 +1498,6 @@
       $('#brh-resume-area').addEventListener('change', (e) => {
         setStore(STORE_KEYS.resume, e.target.value.trim());
         this.showStatus('brh-resume', '已保存，共 ' + e.target.value.trim().length + ' 字', 'ok');
-      });
-
-      // 扫描文件夹
-      const scanBtn = $('#brh-scan-dir');
-      if (scanBtn) scanBtn.onclick = () => scanResumeFolder((msg) => this.showStatus('brh-resume', msg));
-      // 多选 PDF
-      const multiBtn = $('#brh-multi-pdf');
-      if (multiBtn) multiBtn.onclick = () => { const el = $('#brh-multi-input'); if (el) el.click(); };
-      const multiInput = $('#brh-multi-input');
-      if (multiInput) multiInput.addEventListener('change', async (e) => {
-        const files = Array.from(e.target.files || []);
-        if (!files.length) return;
-        await handlePickedFiles(files, (msg) => this.showStatus('brh-resume', msg));
-        e.target.value = '';
-      });
-      // 清空库
-      const clearLib = $('#brh-clear-lib');
-      if (clearLib) clearLib.onclick = () => { setStore(STORE_KEYS.resumeLibrary, null); this.renderResumeTab(); toast('已清空简历库', 'ok'); };
-      // 使用某份简历
-      $$('.brh-lib-use').forEach((b) => {
-        b.onclick = () => {
-          const itemName = b.closest('.brh-lib-item').dataset.lib;
-          const lib = getStore(STORE_KEYS.resumeLibrary, null);
-          let found = null;
-          if (lib) for (const c of lib.categories) { for (const it of c.items) { if (it.name === itemName) { found = it; break; } } if (found) break; }
-          if (found && found.text) {
-            setStore(STORE_KEYS.resume, found.text.trim());
-            this.renderResumeTab();
-            this.showStatus('brh-resume', '✅ 已加载「' + (found.title || found.name) + '」，请去 Boss 页面上传该岗位', 'ok');
-            toast('已加载：' + (found.title || found.name), 'ok');
-          } else { toast('未找到该简历内容', 'err'); }
-        };
       });
     },
 
@@ -1917,7 +1536,7 @@
         <textarea class="brh-area" id="brh-opt-area" style="min-height:240px">${esc(content)}</textarea>
         <div class="brh-tip">可手动微调后重新下载；发送给 HR 前建议通读一遍，确保经历真实。</div>
         <div class="brh-row" style="margin-top:12px">
-          <div class="brh-label">📨 打招呼话术<span class="brh-chip">模板：${esc(tpl.name)}</span>${getStore(STORE_KEYS.greetingFor, '') ? '<span class="brh-chip g" style="margin-left:4px">针对：' + esc(getStore(STORE_KEYS.greetingFor, '')) + '</span>' : ''}</div>
+          <div class="brh-label">📨 该岗位专属打招呼话术<span class="brh-chip">模板：${esc(tpl.name)}</span></div>
           <textarea class="brh-area" id="brh-opt-greet" style="min-height:110px" placeholder="点「开始优化」后自动生成，也可点下方「重新生成」">${esc(greeting)}</textarea>
           <div class="brh-row" style="margin-top:6px">
             <button class="brh-btn green sm" id="brh-opt-greet-copy">📋 复制话术</button>
@@ -1985,7 +1604,6 @@
         </div>
         <div class="brh-row">
           <button class="brh-btn" id="brh-gen-greeting">✍️ 生成打招呼话术</button>
-          ${getStore(STORE_KEYS.greetingFor, '') ? '<span class="brh-chip g" style="margin-left:6px">针对：' + esc(getStore(STORE_KEYS.greetingFor, '')) + '</span>' : ''}
         </div>
         <div class="brh-status" id="brh-chat-status"></div>
         ${content ? `
@@ -2001,18 +1619,16 @@
           <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 提问 + 优化简历生成</span></div>
           <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新提问；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
           <div class="brh-row" style="margin-top:6px">
-            <button class="brh-btn ghost sm" id="brh-hr-grab">🎯 抓取 HR 提问</button>
             <button class="brh-btn" id="brh-hr-gen" ${optimized ? '' : 'disabled title="请先在「优化」页生成优化简历"'}>💬 生成针对性回复</button>
             ${hrA ? '<button class="brh-btn ghost sm" id="brh-hr-regen">🔄 换个说法</button>' : ''}
           </div>
-          <div class="brh-status" id="brh-hr-status" style="margin-top:4px"></div>
           ${hrA ? `
           <textarea class="brh-area" id="brh-hr-reply" style="min-height:110px;margin-top:8px">${esc(hrA)}</textarea>
           <div class="brh-row" style="margin-top:6px">
             <button class="brh-btn green sm" id="brh-hr-copy">📋 复制回复</button>
             <button class="brh-btn sm" id="brh-hr-fill">📝 填入聊天框</button>
           </div>` : ''}
-          <div class="brh-tip">在 HR 聊天页先点「🎯 抓取 HR 提问」识别问题，再点「💬 生成针对性回复」；脚本结合优化后的简历与岗位 JD 生成第一人称回复，生成后请核对数字与事实再发送。</div>
+          <div class="brh-tip">在 HR 聊天页点「生成针对性回复」，脚本会读取 HR 最新提问，结合优化后的简历与岗位 JD 生成第一人称回复；生成后请核对数字与事实再发送。</div>
         </div>`;
       const gen = $('#brh-gen-greeting'); if (gen) gen.onclick = generateGreeting;
       const area = $('#brh-greet-area');
@@ -2022,19 +1638,6 @@
       const hrGen = $('#brh-hr-gen'); if (hrGen) hrGen.onclick = () => {
         setStore(STORE_KEYS.hrQuestion, $('#brh-hr-q').value.trim());
         generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
-      };
-      const hrGrab = $('#brh-hr-grab'); if (hrGrab) hrGrab.onclick = () => {
-        const r = extractHrQuestion();
-        const st = $('#brh-hr-status');
-        if (r.text) {
-          $('#brh-hr-q').value = r.text;
-          setStore(STORE_KEYS.hrQuestion, r.text);
-          if (st) { st.textContent = '✅ 已识别 HR 提问（' + (r.debug || '匹配') + '）'; st.className = 'brh-status ok'; }
-          toast('🎯 已抓取 HR 提问', 'ok');
-        } else {
-          if (st) { st.textContent = '❌ 未识别到 HR 提问（' + (r.debug || '无匹配选择器') + '），请手动粘贴'; st.className = 'brh-status err'; }
-          toast('未识别到 HR 提问，请手动粘贴', 'err');
-        }
       };
       const hrRegen = $('#brh-hr-regen'); if (hrRegen) hrRegen.onclick = () => generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
       const hrCopy = $('#brh-hr-copy'); if (hrCopy) hrCopy.onclick = () => {
@@ -2069,7 +1672,6 @@
         ${isList ? '' : '<div class="brh-tip brh-row" style="color:#f59e0b">当前不是职位列表页，可能扫描不到岗位；请打开 Boss 搜索结果列表页再试。</div>'}
         <div class="brh-row">
           <button class="brh-btn" id="brh-scan">🔍 扫描本页岗位并匹配</button>
-          <button class="brh-btn ghost sm" id="brh-match-debug">🛠 调试</button>
         </div>
         <div class="brh-seg" id="brh-mode">
           <button data-mode="ai" class="on">AI 匹配</button>
@@ -2085,25 +1687,6 @@
       const mode = { v: 'ai' };
       $$('#brh-mode button').forEach((b) => { b.onclick = () => { mode.v = b.dataset.mode; $$('#brh-mode button').forEach((x) => x.classList.toggle('on', x === b)); }; });
       const scan = $('#brh-scan'); if (scan) scan.onclick = () => runMatch(mode.v);
-      const dbg = $('#brh-match-debug'); if (dbg) dbg.onclick = () => {
-        const jobs = extractJobCards();
-        const last = getStore(STORE_KEYS.matchRes, null);
-        let html = '<div style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;margin-top:8px;font-size:12.5px;color:#cbd5e1;max-height:260px;overflow:auto">';
-        html += '<b>🛠 调试信息</b> · 扫描到 ' + jobs.length + ' 个岗位卡片<br><br>';
-        if (!jobs.length) { html += '❌ 未扫描到岗位卡片。当前选择器均未匹配。<br>请确认在 Boss <b>职位列表页</b>（搜索结果页）操作。'; }
-        else {
-          html += '<b>提取到的岗位：</b><br>';
-          jobs.forEach((j, i) => { html += (i + 1) + '. ' + (j.title || '—') + (j.salary ? ' [' + j.salary + ']' : '') + (j.company ? ' @' + j.company : '') + '<br>'; });
-          if (last && last.length) {
-            html += '<br><b>最近一次匹配结果（' + last.length + ' 条）：</b><br>';
-            last.forEach((r) => { html += '  idx' + r.idx + ' → ' + r.score + '分/' + r.fit + '：' + (r.reason || '') + '<br>'; });
-          }
-        }
-        html += '</div>';
-        const box = $('#brh-match-debug-box'); if (box) box.remove();
-        const div = document.createElement('div'); div.id = 'brh-match-debug-box'; div.innerHTML = html;
-        $('#brh-match-list').parentNode.insertBefore(div, $('#brh-match-list'));
-      };
       const og = $('#brh-only-good'); if (og) og.onclick = () => filterPage('good');
       const sa = $('#brh-show-all'); if (sa) sa.onclick = () => filterPage('all');
       if (lastRes) {
