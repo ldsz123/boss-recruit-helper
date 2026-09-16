@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.6.4
+// @version      1.6.5
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -60,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.4';
+  const VERSION = '1.6.5';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -737,28 +737,80 @@
 
   /* ---- HR 智能回复：抓取 HR 最新提问 → 结合优化简历与 JD 生成针对性回复 ---- */
 
-  // 从聊天窗口抓取 HR 的最新消息（Boss 消息 DOM 无稳定 class，做多选择器 + 关键词兜底）
+
+  // 超宽泛多策略抓取聊天里对方（HR）的最新一条消息：返回 { text, debug }
   function extractHrQuestion() {
-    const candidates = [
+    const debug = [];
+
+    // 策略 1：用具体 class 选择器（Boss 各版本常见聊天 DOM）
+    const selectors = [
       '.im-list .im-item .im-msg-left',
-      '.im-item .msg-left',
-      '.chat-message .msg-left',
-      '.message-list .left',
+      '.im-list .im-item:not(.im-msg-right) .im-msg',
+      '.im-msg-left',
+      '.msg-left',
+      '.chat-message.left .message-content',
+      '.chat-message:not(.right):not(.self) .msg-text',
+      '.message-list .left .msg-content',
+      '.message-item:not(.self):not(.mine) .message-content',
+      '.msg-item.left .msg-text',
+      '.im-item .message-content',
       '[class*="msg-left"]',
-      '[class*="im-msg-left"]'
+      '[class*="message"][class*="left"]',
+      '.chat-msg .msg-text'
     ];
-    let best = '';
-    for (const sel of candidates) {
-      $$(sel).forEach((el) => {
-        const t = txt(el);
-        // 只要像「提问」的气泡：含问号/疑问词，或明显长于寒暄
-        if (t && t.length > 4 && t.length < 500 && /[?？]|请教|了解|方便|期望|考虑|为什么|多久|薪资|经验|介绍|到岗|住址|离职|加班/.test(t)) {
-          if (t.length >= best.length) best = t;
-        }
-      });
-      if (best) break;
+    let msgs = [];
+    for (const sel of selectors) {
+      try {
+        const els = $$(sel);
+        if (els.length) { debug.push(sel + ' → ' + els.length + ' 个'); break; }
+      } catch (e) {}
     }
-    return best;
+
+    // 策略 2：遍历所有聊天容器，按 class 区分自己/对方，收集全部消息后取最后一条
+    if (!msgs.length) {
+      const containers = [
+        '.im-list', '.message-list', '.chat-message-list', '.msg-list',
+        '.chat-content', '.im-chat', '.chat-list', '[class*="message-list"]',
+        '[class*="chat-content"]', '[class*="msg-list"]'
+      ];
+      for (const cSel of containers) {
+        const c = $(cSel);
+        if (!c) continue;
+        const items = $$('[class*="item"], [class*="message"], [class*="msg"]', c);
+        items.forEach((el) => {
+          const cls = ((el.className || '') + ' ' + ((el.parentElement && el.parentElement.className) || '')).toString();
+          const mine = SELF_MSG_RE.test(cls);
+          if (mine) return;
+          const t = cleanText(txt(el));
+          if (t && t.length >= 2 && t.length < 800) msgs.push(t);
+        });
+        if (msgs.length) { debug.push('遍历 ' + cSel + ' → 对方 ' + msgs.length + ' 条'); break; }
+      }
+    }
+
+    // 策略 3：终极兜底 —— 取页面上所有可见文本块中属于聊天区域的
+    if (!msgs.length) {
+      const all = document.querySelectorAll('div, span, p');
+      for (const el of all) {
+        if (el.children.length > 4) continue;
+        const t = cleanText(txt(el));
+        if (t && t.length >= 4 && t.length < 500) {
+          const cls = (el.className || '');
+          if (!SELF_MSG_RE.test(cls) && !/[时间戳|time|date|status|系统提示]/.test(cls)) {
+            // 只在 chat 地理区域内
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 100 && rect.height > 10 && rect.top > 100 && rect.top < window.innerHeight - 50) {
+              msgs.push(t);
+            }
+          }
+        }
+      }
+      if (msgs.length) debug.push('全文兜底 → ' + msgs.length + ' 条');
+    }
+
+    // 取最后一条（最新的），而不是「最像提问的」
+    const best = msgs.length ? msgs[msgs.length - 1] : '';
+    return { text: best, debug: debug.join(' | ') };
   }
 
   function generateHrReply(opts = {}) {
@@ -767,10 +819,15 @@
     if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
     const jd = getStore(STORE_KEYS.jd, '');
     const manual = opts.manual || '';
-    let question = manual || extractHrQuestion();
+    const picked = extractHrQuestion();
+    let question = manual || picked.text;
+    // 反馈抓到了什么（方便用户确认 / 排查）
+    if (!manual && picked.debug && question) {
+      toast('🎯 已识别 HR 最新消息（' + ((picked.debug.split('→').pop() || '').trim() || '匹配') + '）', 'ok');
+    }
     if (!question) {
       // 页面上抓不到 → 让用户手动粘贴 HR 的问题
-      const v = prompt('未在当前页面识别到 HR 的新提问。\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
+      const v = prompt('未在当前页面识别到 HR 的消息。\n\n调试信息：' + (picked.debug || '无匹配选择器') + '\n\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
       if (!v || !v.trim()) return;
       question = v.trim();
     }
@@ -1879,12 +1936,14 @@
         <div class="brh-tip">先生成打招呼话术；然后可一键填入 Boss 聊天框，并把优化后的简历以图片形式发给当前 HR。</div>`}
 
         <div class="brh-row" style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
-          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 提问 + 优化简历生成</span></div>
-          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新提问；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
+          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 最新提问 + 优化简历生成</span></div>
+          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新消息；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
           <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn ghost sm" id="brh-hr-grab">🎯 抓取 HR 提问</button>
             <button class="brh-btn" id="brh-hr-gen" ${optimized ? '' : 'disabled title="请先在「优化」页生成优化简历"'}>💬 生成针对性回复</button>
             ${hrA ? '<button class="brh-btn ghost sm" id="brh-hr-regen">🔄 换个说法</button>' : ''}
           </div>
+          <div class="brh-status" id="brh-hr-status"></div>
           ${hrA ? `
           <textarea class="brh-area" id="brh-hr-reply" style="min-height:110px;margin-top:8px">${esc(hrA)}</textarea>
           <div class="brh-row" style="margin-top:6px">
@@ -1901,6 +1960,19 @@
       const hrGen = $('#brh-hr-gen'); if (hrGen) hrGen.onclick = () => {
         setStore(STORE_KEYS.hrQuestion, $('#brh-hr-q').value.trim());
         generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
+      };
+      const hrGrab = $('#brh-hr-grab'); if (hrGrab) hrGrab.onclick = () => {
+        const r = extractHrQuestion();
+        const st = $('#brh-hr-status');
+        if (r.text) {
+          $('#brh-hr-q').value = r.text;
+          setStore(STORE_KEYS.hrQuestion, r.text);
+          if (st) { st.textContent = '✅ 已识别 HR 最新消息（' + (r.debug || '匹配') + '）'; st.className = 'brh-status ok'; }
+          toast('🎯 已抓取 HR 最新消息', 'ok');
+        } else {
+          if (st) { st.textContent = '❌ 未识别到 HR 消息（' + (r.debug || '无匹配选择器') + '），请手动粘贴'; st.className = 'brh-status err'; }
+          toast('未识别到 HR 消息，请手动粘贴', 'err');
+        }
       };
       const hrRegen = $('#brh-hr-regen'); if (hrRegen) hrRegen.onclick = () => generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
       const hrCopy = $('#brh-hr-copy'); if (hrCopy) hrCopy.onclick = () => {
