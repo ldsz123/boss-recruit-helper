@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.6.1
+// @version      1.6.2
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -40,6 +40,7 @@
     resumeLibrary: 'brh_resume_lib', // 简历库：按岗位分类的简历 { categories: [{name, items:[{name,text,title}]}] }
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
+    greetingFor: 'brh_greeting_for', // 该话术对应的岗位名（用于 UI 提示）
     hrQuestion: 'brh_hr_question', // 最近一次 HR 提问（智能回复用）
     hrReply: 'brh_hr_reply',    // 最近一次生成的 HR 回复
     greetingTpl: 'brh_greeting_tpl',        // 当前选中的话术模板 id
@@ -59,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.1';
+  const VERSION = '1.6.2';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -514,7 +515,7 @@
           text += content.items.map((it) => it.str || '').join(' ') + '\n';
         }
         if (!text.trim()) throw new Error('PDF 未提取到文字（可能是扫描件/图片型）');
-        return text.trim();
+        return cleanText(text.trim());
       } catch (e) { throw new Error('PDF 解析失败：' + e.message); }
     }
     if (name.endsWith('.docx')) {
@@ -698,7 +699,7 @@
           const data = JSON.parse(res.responseText);
           const content = data.choices?.[0]?.message?.content?.trim();
           if (!content) throw new Error('接口未返回内容');
-          onDone(content);
+          onDone(cleanText(content));
         } catch (e) {
           UI.showStatus(sk, '调用失败：' + e.message, 'err');
         }
@@ -773,8 +774,22 @@
 
   function generateGreeting(opts) {
     opts = opts || {};
-    const jd = getStore(STORE_KEYS.jd, '');
-    const resume = getStore(STORE_KEYS.resume, '');
+
+    // 关键修复：生成话术前，优先从当前页面重新提取 JD，确保话术对应当前岗位
+    // （避免用户换了岗位页面但存储的 JD 仍是旧岗位，导致话术按第一个岗位生成）
+    let jd = getStore(STORE_KEYS.jd, '');
+    let meta = getStore(STORE_KEYS.jdMeta, {});
+    if (/\/job_detail|\/geek\/job\//.test(location.pathname)) {
+      const fresh = extractJD();
+      if (fresh && (fresh.sections.length || fresh.title)) {
+        jd = jdToText(fresh);
+        meta = { title: fresh.title, company: fresh.company, salary: fresh.salary, url: location.href, time: nowStr() };
+        setStore(STORE_KEYS.jd, jd);
+        setStore(STORE_KEYS.jdMeta, meta);
+        UI.showJdMeta(meta);
+      }
+    }
+
     if (!jd || jd.length < 30) {
       if (!opts.silent) { toast('请先抓取 JD', 'err'); UI.switchTab('jd'); }
       return;
@@ -783,15 +798,16 @@
     const sys = fillTemplate(tpl.prompt, jd);
     const messages = [
       { role: 'system', content: sys },
-      { role: 'user', content: `${jd}\n\n【我的简历】\n${resume || '（未提供，请根据岗位写通用话术，留出可替换的经历占位）'}` }
+      { role: 'user', content: `${jd}\n\n【我的简历】\n${getStore(STORE_KEYS.resume, '') || '（未提供，请根据岗位写通用话术，留出可替换的经历占位）'}` }
     ];
-    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在生成打招呼话术…');
+    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在生成「' + (meta.title || '当前岗位') + '」的打招呼话术…');
     callLLM(messages, (content) => {
       setStore(STORE_KEYS.greeting, content);
+      setStore(STORE_KEYS.greetingFor, meta.title || ''); // 记录该话术对应哪个岗位，供 UI 展示
       if (!opts.silent) {
         UI.renderGreeting(content);
-        UI.showStatus('brh-chat', '✅ 话术已生成，可直接填入聊天框', 'ok');
-        toast('话术已生成', 'ok');
+        UI.showStatus('brh-chat', '✅ 「' + (meta.title || '当前岗位') + '」话术已生成，可直接填入聊天框', 'ok');
+        toast('「' + (meta.title || '当前岗位') + '」话术已生成', 'ok');
       }
       // 若优化页正打开，刷新其话术区块
       const ga = $('#brh-opt-greet');
@@ -1042,6 +1058,15 @@
     return String(s || '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  }
+
+  /* 清洗文本：去掉零宽字符、BOM、非法 Unicode 替换符（常用于修复「乱码」） */
+  function cleanText(s) {
+    return String(s || '')
+      .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')   // 零宽字符 / BOM / 软连字符
+      .replace(/\uFFFD/g, '')                         // Unicode 替换符 �
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')   // 控制字符（保留 \t \n \r）
+      .trim();
   }
 
   // 把优化后的 Markdown 解析成结构化数据（姓名 / 求职意向 / 分区）
@@ -1694,6 +1719,15 @@
       if (type === 'err') toast(msg, 'err');
     },
 
+    /* ---- 刷新 JD 页岗位信息条（生成话术后用于同步岗位名） ---- */
+    showJdMeta(meta) {
+      const el = $('#brh-jd-meta');
+      if (!el || !meta || !meta.title) return;
+      el.innerHTML = '已捕获：<span class="brh-chip">' + esc(meta.title) + '</span>' +
+        (meta.salary ? '<span class="brh-chip">' + esc(meta.salary) + '</span>' : '') +
+        (meta.company ? '<span class="brh-chip">' + esc(meta.company) + '</span>' : '');
+    },
+
     /* ---- JD 页 ---- */
     renderJdTab() {
       const body = $('#brh-body', this.root);
@@ -1870,7 +1904,7 @@
         <textarea class="brh-area" id="brh-opt-area" style="min-height:240px">${esc(content)}</textarea>
         <div class="brh-tip">可手动微调后重新下载；发送给 HR 前建议通读一遍，确保经历真实。</div>
         <div class="brh-row" style="margin-top:12px">
-          <div class="brh-label">📨 该岗位专属打招呼话术<span class="brh-chip">模板：${esc(tpl.name)}</span></div>
+          <div class="brh-label">📨 打招呼话术<span class="brh-chip">模板：${esc(tpl.name)}</span>${getStore(STORE_KEYS.greetingFor, '') ? '<span class="brh-chip g" style="margin-left:4px">针对：' + esc(getStore(STORE_KEYS.greetingFor, '')) + '</span>' : ''}</div>
           <textarea class="brh-area" id="brh-opt-greet" style="min-height:110px" placeholder="点「开始优化」后自动生成，也可点下方「重新生成」">${esc(greeting)}</textarea>
           <div class="brh-row" style="margin-top:6px">
             <button class="brh-btn green sm" id="brh-opt-greet-copy">📋 复制话术</button>
@@ -1938,6 +1972,7 @@
         </div>
         <div class="brh-row">
           <button class="brh-btn" id="brh-gen-greeting">✍️ 生成打招呼话术</button>
+          ${getStore(STORE_KEYS.greetingFor, '') ? '<span class="brh-chip g" style="margin-left:6px">针对：' + esc(getStore(STORE_KEYS.greetingFor, '')) + '</span>' : ''}
         </div>
         <div class="brh-status" id="brh-chat-status"></div>
         ${content ? `
