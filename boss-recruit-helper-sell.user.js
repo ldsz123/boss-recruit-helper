@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.6.0
+// @version      1.6.4
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -36,6 +36,7 @@
     jd: 'brh_jd',            // 最近抓取的 JD 文本
     jdMeta: 'brh_jd_meta',   // { title, company, salary, url, time }
     jdExplain: 'brh_jd_explain', // AI 岗位需求理解（缓存）
+    jdFit: 'brh_jd_fit',       // 岗位适配度分析（缓存）
     resume: 'brh_resume',    // 用户原始简历文本
     resumeLibrary: 'brh_resume_lib', // 简历库：按岗位分类的简历
     optimized: 'brh_optimized', // 最近一次优化结果
@@ -59,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.4';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -942,6 +943,37 @@
     toast('已打开小红书搜索：' + kw, 'ok');
   }
 
+  /* ---- 岗位适配度：简历 vs JD 匹配分析 ---- */
+  function analyzeFit() {
+    if (!isPro('optimize')) { showLicenseModal('optimize', () => analyzeFit()); return; }
+    const jd = getStore(STORE_KEYS.jd, '');
+    const resume = getStore(STORE_KEYS.resume, '');
+    if (!jd || jd.length < 30) { toast('请先抓取或粘贴 JD', 'err'); UI.switchTab('jd'); return; }
+    if (!resume || resume.length < 50) { toast('请先上传简历', 'err'); UI.switchTab('resume'); return; }
+    const meta = getStore(STORE_KEYS.jdMeta, {});
+    UI.showStatus('brh-jd', 'AI 正在分析岗位适配度…');
+    const sys = [
+      '你是资深招聘专家。请根据【候选人简历】和【目标岗位 JD】，评估候选人与该岗位的适配度。',
+      '请按以下结构输出中文分析（不要 Markdown 标题，直接输出正文，用「【】」标出小标题）：',
+      '【适配度评分】给出 0~100 的综合评分，以及「高度适配 / 部分适配 / 适配度较低」三档定性评价。',
+      '【优势匹配】3~5 条，说明简历中哪些经历/技能/项目与岗位要求高度契合，引用 JD 具体要求对应说明。',
+      '【差距分析】2~4 条，说明简历相比岗位要求的不足之处（如缺少某技能、经验年限不够、项目方向偏差等）。',
+      '【简历优化建议】3~5 条具体可操作的建议：如何改写/补充哪些经历、突出哪些关键词、弥补哪些短板，使简历更匹配该岗位。',
+      '【面试准备提示】2~3 条，基于岗位要求和候选人背景，面试最可能被追问的点及准备方向。',
+      '要求：建议必须针对该岗位和该候选人的实际情况，不要泛泛而谈；总字数 500~800 字；只输出分析，不要开场白和结束语。'
+    ].join('\n');
+    callLLM(
+      [{ role: 'system', content: sys }, { role: 'user', content: `${meta.title ? '【目标岗位】' + meta.title + '\n' : ''}${meta.company ? '【公司】' + meta.company + '\n' : ''}${meta.salary ? '【薪资】' + meta.salary + '\n' : ''}【岗位 JD】\n${jd}\n\n【候选人简历】\n${resume}` }],
+      (content) => {
+        setStore(STORE_KEYS.jdFit, content);
+        if ($('#brh-jd-fit')) $('#brh-jd-fit').value = content;
+        UI.showStatus('brh-jd', '✅ 岗位适配度分析完成', 'ok');
+        toast('岗位适配度分析完成', 'ok');
+      },
+      'brh-jd'
+    );
+  }
+
   // 把优化后的 Markdown 解析成结构化数据（姓名 / 求职意向 / 分区）
   function parseResumeMarkdown(md) {
     const lines = String(md || '').split(/\r?\n/);
@@ -1604,6 +1636,7 @@
       const jd = getStore(STORE_KEYS.jd, '');
       const meta = getStore(STORE_KEYS.jdMeta, {});
       const explain = getStore(STORE_KEYS.jdExplain, '');
+      const fit = getStore(STORE_KEYS.jdFit, '');
       body.innerHTML = `
         <div class="brh-row">
           <button class="brh-btn" id="brh-grab">🎯 抓取本页岗位 JD</button>
@@ -1615,12 +1648,15 @@
         ${jd ? `
         <div class="brh-row" style="margin-top:10px">
           <button class="brh-btn ghost sm" id="brh-explain">📖 岗位需求理解</button>
+          <button class="brh-btn ghost sm" id="brh-fit" ${meta.title ? '' : 'disabled title="请先抓取/粘贴 JD"'}>📊 岗位适配度</button>
           <button class="brh-btn ghost sm" id="brh-xhs" ${meta.title ? '' : 'disabled title="请先抓取/粘贴 JD 获取岗位名称"'}>📕 小红书搜经验</button>
         </div>
         <div class="brh-status" id="brh-explain-status"></div>
         ${explain ? `<div class="brh-row" style="margin-top:8px"><div class="brh-label">📖 岗位需求解读</div><textarea class="brh-area" id="brh-jd-explain" style="min-height:120px;line-height:1.8">${esc(explain)}</textarea>
           <div class="brh-row" style="margin-top:6px"><button class="brh-btn ghost sm" id="brh-explain-copy">📋 复制解读</button></div></div>` : ''}
-        <div class="brh-tip">「岗位需求理解」用大白话讲清岗位做什么/需要什么能力/职业方向，帮你有针对性地优化简历。<br>「小红书搜经验」一键打开小红书搜索该岗位的面经/薪资/避坑帖。</div>` : ''}
+        ${fit ? `<div class="brh-row" style="margin-top:8px"><div class="brh-label">📊 岗位适配度分析</div><textarea class="brh-area" id="brh-jd-fit" style="min-height:120px;line-height:1.8">${esc(fit)}</textarea>
+          <div class="brh-row" style="margin-top:6px"><button class="brh-btn ghost sm" id="brh-fit-copy">📋 复制分析</button></div></div>` : ''}
+        <div class="brh-tip">「岗位需求理解」用大白话讲清岗位做什么/需要什么能力/职业方向。<br>「岗位适配度」对比你的简历与 JD，给出匹配分数 + 优化建议。<br>「小红书搜经验」一键打开小红书搜索该岗位的面经/薪资/避坑帖。</div>` : ''}
       `;
       $('#brh-grab').onclick = () => {
         const r = extractJD();
@@ -1631,14 +1667,20 @@
         this.showStatus('brh-jd', `✅ 已捕获 ${r.sections.length} 个板块（${nowStr()}）`, 'ok');
         toast('JD 抓取成功', 'ok');
       };
-      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); setStore(STORE_KEYS.jdExplain, ''); this.renderJdTab(); };
+      $('#brh-clear-jd').onclick = () => { setStore(STORE_KEYS.jd, ''); setStore(STORE_KEYS.jdMeta, {}); setStore(STORE_KEYS.jdExplain, ''); setStore(STORE_KEYS.jdFit, ''); this.renderJdTab(); };
       $('#brh-jd-area').addEventListener('change', (e) => { setStore(STORE_KEYS.jd, e.target.value); this.showStatus('brh-jd', '已保存手动编辑', 'ok'); });
       const explainBtn = $('#brh-explain'); if (explainBtn) explainBtn.onclick = () => explainPosition();
+      const fitBtn = $('#brh-fit'); if (fitBtn) fitBtn.onclick = () => analyzeFit();
       const xhsBtn = $('#brh-xhs'); if (xhsBtn) xhsBtn.onclick = () => searchXhs(meta.title || '');
       const explainCopy = $('#brh-explain-copy'); if (explainCopy) explainCopy.onclick = () => {
         const v = getStore(STORE_KEYS.jdExplain, '');
         if (!v) { toast('暂无解读', 'err'); return; }
         navigator.clipboard.writeText(v).then(() => toast('岗位解读已复制', 'ok'), () => toast('复制失败', 'err'));
+      };
+      const fitCopy = $('#brh-fit-copy'); if (fitCopy) fitCopy.onclick = () => {
+        const v = getStore(STORE_KEYS.jdFit, '');
+        if (!v) { toast('暂无分析', 'err'); return; }
+        navigator.clipboard.writeText(v).then(() => toast('适配度分析已复制', 'ok'), () => toast('复制失败', 'err'));
       };
     },
 
@@ -2337,7 +2379,7 @@
   const LICENSE_API = '';
 
   const GUARD_FEATURES = {
-    optimize: 'AI 简历优化 / 岗位需求理解 / 简历库',
+    optimize: 'AI 简历优化 / 岗位需求理解 / 适配度分析 / 简历库',
     match: '岗位扫描匹配',
     greeting: 'AI 话术生成 / HR 回复',
     export: 'PDF / 图片导出',
