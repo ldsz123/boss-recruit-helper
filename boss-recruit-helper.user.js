@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.6.0
+// @version      1.6.1
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -37,6 +37,7 @@
     jdMeta: 'brh_jd_meta',   // { title, company, salary, url, time }
     jdExplain: 'brh_jd_explain', // AI 岗位解释（缓存）
     resume: 'brh_resume',    // 用户原始简历文本
+    resumeLibrary: 'brh_resume_lib', // 简历库：按岗位分类的简历 { categories: [{name, items:[{name,text,title}]}] }
     optimized: 'brh_optimized', // 最近一次优化结果
     greeting: 'brh_greeting',   // 最近一次打招呼话术
     hrQuestion: 'brh_hr_question', // 最近一次 HR 提问（智能回复用）
@@ -58,7 +59,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.1';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -119,7 +120,10 @@
       cursor: move; user-select: none; }
     .brh-header b { flex: 1; font-size: 14px; }
     .brh-header .brh-min { cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; opacity: .9; }
-    .brh-tabs { display: flex; border-bottom: 1px solid #ebeef5; }
+    .brh-lib-cat-name{ font-size:13.5px;color:#cbd5e1;padding:6px 0;border-bottom:1px solid #e2e8f0;margin-bottom:4px }
+  .brh-lib-item{ display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;background:#f8fafc;margin:3px 0;border:1px solid #e2e8f0;font-size:13px;color:#334155 }
+  .brh-lib-item:hover{ background:#eef2f7;border-color:#2563eb }
+  .brh-lib-item span:nth-child(2){ flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
     .brh-tabs .brh-tab { flex: 1; text-align: center; padding: 8px 0; cursor: pointer;
       color: #909399; border-bottom: 2px solid transparent; }
     .brh-tabs .brh-tab.on { color: #00a1ea; border-bottom-color: #00a1ea; font-weight: 600; }
@@ -529,8 +533,137 @@
   }
 
   /* ============================================================
+   * 2.8 简历库：扫描文件夹 / 多选 PDF → AI 按岗位分类
+   * ========================================================== */
+
+  // 从单个 File 对象提取文本（复用 parseResumeFile 的逻辑，但返回 {name, text}）
+  async function extractPdfText(file) {
+    const text = await parseResumeFile(file);
+    return { name: file.name || '未命名', text: text.trim() };
+  }
+
+  // 递归扫描文件夹里的 PDF（File System Access API）
+  async function scanPdfFilesInDir(dirHandle, out, depth) {
+    depth = depth || 0;
+    if (depth > 4) return; // 最多 4 层子目录，避免过深
+    try {
+      for await (const entry of dirHandle.values()) {
+        if (entry.kind === 'file' && (entry.name || '').toLowerCase().endsWith('.pdf')) {
+          try {
+            const file = await entry.getFile();
+            out.push(file);
+          } catch (e) { /* 跳过读不到的文件 */ }
+        } else if (entry.kind === 'directory' && depth < 4) {
+          await scanPdfFilesInDir(entry, out, depth + 1);
+        }
+      }
+    } catch (e) { /* 权限不足等 */ }
+  }
+
+  // AI 批量分类：把多份简历归纳为按岗位分的类别
+  // items: [{name, text}]  →  return [{category, items:[{name, title, text}]}]
+  async function aiCategorizeResumes(items, onProgress, onDone) {
+    // 先各自提取「文件名 + 前 150 字」作为摘要，减少 token
+    const summaries = items.map((it, i) => ({
+      i, name: it.name,
+      snippet: (it.text || '').replace(/\s+/g, ' ').slice(0, 150)
+    }));
+    const sys = [
+      '你是简历分类专家。下面给出若干份简历的文件名与开头摘要，请完成：',
+      '1. 按「岗位」把简历归到不同类别（如「Java 后端」「前端」「产品运营」「UI 设计」「数据分析」「行政人事」「销售」「财务」等，按实际内容判断，不要强行归入不相关的类）；',
+      '2. 每份简历提取一个「岗位标题」（12 字内，如「Java 后端工程师」），依据是简历中最匹配的岗位方向；',
+      '3. 只输出 JSON，不要任何解释，格式：{"categories":[{"category":"类别名","items":[{"i":序号,"title":"岗位标题"}]}]}',
+      '要求：类别数 1~8 个；每份简历只归到一个类；类别名用 4~8 个字的中文。'
+    ].join('\n');
+    const user = '【简历列表】\n' + summaries.map((s) => `${s.i}. ${s.name}：${s.snippet}`).join('\n');
+
+    callLLM(
+      [{ role: 'system', content: sys }, { role: 'user', content: user }],
+      (content) => {
+        let result;
+        try {
+          const m = content.match(/\{[\s\S]*\}/);
+          result = JSON.parse(m ? m[0] : content);
+        } catch (e) { result = null; }
+        if (!result || !result.categories) {
+          // 解析失败兜底：全归到一个「未分类」
+          result = { categories: [{ category: '未分类简历', items: items.map((it, i) => ({ i, title: it.name.replace(/\.pdf$/i, '') })) }] };
+        }
+        // 把 i 映射回完整的 name/text
+        const byIdx = {};
+        items.forEach((it, i) => { byIdx[i] = it; });
+        const categories = result.categories.map((c) => ({
+          category: c.category,
+          items: (c.items || []).map((r) => {
+            const src = byIdx[r.i];
+            return { name: src ? src.name : (r.name || '未知'), title: (r.title || (src && src.name.replace(/\.pdf$/i, '')) || '未知'), text: src ? src.text : '' };
+          }).filter((x) => x.text)
+        })).filter((c) => c.items.length);
+        onDone(categories);
+      },
+      'brh-lib'
+    );
+  }
+
+  /* ============================================================
    * 3. LLM 调用（OpenAI 兼容 /chat/completions）
    * ========================================================== */
+
+  // 入口：扫描文件夹（File System Access API，不支持时降级为多选）
+  async function scanResumeFolder(statusCb) {
+    statusCb = statusCb || function () {};
+    if (!('showDirectoryPicker' in window)) {
+      statusCb('当前浏览器不支持文件夹选择，请使用「多选 PDF」');
+      toast('请改用「多选 PDF」方式', 'err');
+      return;
+    }
+    let dirHandle;
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      statusCb('未选择文件夹：' + (e && e.message || e));
+      return;
+    }
+    statusCb('正在扫描「' + dirHandle.name + '」…');
+    const pdfs = [];
+    await scanPdfFilesInDir(dirHandle, pdfs, 0);
+    if (!pdfs.length) { statusCb('该文件夹（含子目录）未找到 PDF 文件'); toast('未找到 PDF', 'err'); return; }
+    statusCb('找到 ' + pdfs.length + ' 份 PDF，正在解析…');
+    await handlePickedFiles(pdfs, statusCb);
+  }
+
+  // 入口：处理一批 PDF 文件（解析 → AI 分类 → 入库）
+  async function handlePickedFiles(files, statusCb) {
+    statusCb = statusCb || function () {};
+    if (!files || !files.length) { statusCb('未收到文件'); return; }
+    const total = files.length;
+    statusCb('解析第 1/' + total + ' 份…');
+    const items = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      try {
+        const r = await extractPdfText(f);
+        if (r.text) items.push({ name: r.name, text: r.text });
+        statusCb('解析第 ' + (i + 1) + '/' + total + ' 份…（' + items.length + ' 份有效）');
+      } catch (e) {
+        statusCb('跳过 ' + (f.name || '未命名') + '：' + (e && e.message || e));
+      }
+    }
+    if (!items.length) { statusCb('没有可识别的 PDF（可能是扫描件或图片型）'); toast('解析失败', 'err'); return; }
+    statusCb('AI 正在按岗位分类（共 ' + items.length + ' 份）…');
+    await new Promise((resolve) => {
+      aiCategorizeResumes(items, statusCb, (categories) => {
+        const lib = { categories, updated: Date.now() };
+        setStore(STORE_KEYS.resumeLibrary, lib);
+        UI.renderResumeTab();
+        const catCount = categories.length;
+        statusCb('✅ 完成：' + catCount + ' 个岗位类别，共 ' + items.length + ' 份简历');
+        toast('已分类 ' + items.length + ' 份到 ' + catCount + ' 个岗位', 'ok');
+        resolve();
+      });
+    });
+  }
 
   function callLLM(messages, onDone, statusKey) {
     const sk = statusKey || '优化状态';
@@ -1619,6 +1752,8 @@
     renderResumeTab() {
       const body = $('#brh-body', this.root);
       const resume = getStore(STORE_KEYS.resume, '');
+      const lib = getStore(STORE_KEYS.resumeLibrary, null);
+      const cats = (lib && lib.categories) ? lib.categories : [];
       body.innerHTML = `
         <div class="brh-row">
           <label class="brh-btn green" style="cursor:pointer">📎 上传简历（PDF / Word / TXT / MD）
@@ -1626,8 +1761,28 @@
           </label>
         </div>
         <div class="brh-tip brh-row">支持 PDF、Word(.docx)、TXT、MD。老版 .doc 暂不支持（请另存为 .docx 或 PDF）。解析全程在本地浏览器完成，不上传任何服务器。</div>
-        <textarea class="brh-area" id="brh-resume-area" style="min-height:220px" placeholder="粘贴或上传你的简历全文（教育背景、工作经历、项目经历、技能…）">${esc(resume)}</textarea>
+        <textarea class="brh-area" id="brh-resume-area" style="min-height:160px" placeholder="粘贴或上传你的简历全文（教育背景、工作经历、项目经历、技能…）">${esc(resume)}</textarea>
         <div class="brh-status" id="brh-resume-status">${resume ? '已有简历 ' + resume.length + ' 字' : ''}</div>
+
+        <div class="brh-row" style="margin-top:12px">
+          <button class="brh-btn ghost sm" id="brh-scan-dir">📁 扫描文件夹</button>
+          <button class="brh-btn ghost sm" id="brh-multi-pdf">📎 多选 PDF</button>
+          ${cats.length ? '<button class="brh-btn ghost sm" id="brh-clear-lib">🗑 清空库</button>' : ''}
+        </div>
+        <input type="file" id="brh-multi-input" accept=".pdf,application/pdf" multiple style="display:none">
+        <div class="brh-status" id="brh-lib-status"></div>
+        ${cats.length ? `<div class="brh-row" style="margin-top:10px"><div class="brh-label">📚 简历库 <span class="brh-chip">${cats.length} 个岗位 · ${cats.reduce((a,c)=>a+c.items.length,0)} 份</span></div></div>
+          <div id="brh-lib-list">${cats.map((c)=>`
+            <div class="brh-lib-cat" style="margin-top:10px">
+              <div class="brh-lib-cat-name"><b>📂 ${esc(c.category)}</b> <span style="color:#64748b;font-size:12px">(${c.items.length} 份)</span></div>
+              ${c.items.map((it)=>`<div class="brh-lib-item" title="${esc(it.name)}" data-lib="${esc(it.name)}">
+                <span>📄 ${esc(it.title || it.name)}</span>
+                <span style="font-size:11px;color:#64748b">${esc(it.name)}</span>
+                <button class="brh-btn ghost sm brh-lib-use" style="margin-left:auto">使用</button>
+              </div>`).join('')}
+            </div>`).join('')}
+          </div>
+          <div class="brh-tip">AI 已按岗位把简历分好类。点「使用」加载到上方文本框 → 再去 Boss 页面上传该岗位（需手动操作）。</div>` : '<div class="brh-tip">📁 扫描电脑文件夹里的 PDF（自动递归子目录）或 📎 多选 PDF，AI 会按岗位自动分类整理。'}
       `;
       $('#brh-resume-file').addEventListener('change', async (e) => {
         const f = e.target.files[0];
@@ -1645,6 +1800,38 @@
       $('#brh-resume-area').addEventListener('change', (e) => {
         setStore(STORE_KEYS.resume, e.target.value.trim());
         this.showStatus('brh-resume', '已保存，共 ' + e.target.value.trim().length + ' 字', 'ok');
+      });
+
+      // 扫描文件夹
+      const scanBtn = $('#brh-scan-dir');
+      if (scanBtn) scanBtn.onclick = () => scanResumeFolder((msg) => this.showStatus('brh-resume', msg));
+      // 多选 PDF
+      const multiBtn = $('#brh-multi-pdf');
+      if (multiBtn) multiBtn.onclick = () => { const el = $('#brh-multi-input'); if (el) el.click(); };
+      const multiInput = $('#brh-multi-input');
+      if (multiInput) multiInput.addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files || []);
+        if (!files.length) return;
+        await handlePickedFiles(files, (msg) => this.showStatus('brh-resume', msg));
+        e.target.value = '';
+      });
+      // 清空库
+      const clearLib = $('#brh-clear-lib');
+      if (clearLib) clearLib.onclick = () => { setStore(STORE_KEYS.resumeLibrary, null); this.renderResumeTab(); toast('已清空简历库', 'ok'); };
+      // 使用某份简历
+      $$('.brh-lib-use').forEach((b) => {
+        b.onclick = () => {
+          const itemName = b.closest('.brh-lib-item').dataset.lib;
+          const lib = getStore(STORE_KEYS.resumeLibrary, null);
+          let found = null;
+          if (lib) for (const c of lib.categories) { for (const it of c.items) { if (it.name === itemName) { found = it; break; } } if (found) break; }
+          if (found && found.text) {
+            setStore(STORE_KEYS.resume, found.text.trim());
+            this.renderResumeTab();
+            this.showStatus('brh-resume', '✅ 已加载「' + (found.title || found.name) + '」，请去 Boss 页面上传该岗位', 'ok');
+            toast('已加载：' + (found.title || found.name), 'ok');
+          } else { toast('未找到该简历内容', 'err'); }
+        };
       });
     },
 
