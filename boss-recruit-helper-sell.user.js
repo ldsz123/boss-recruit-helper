@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.6.5
+// @version      1.6.6
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -60,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.5';
+  const VERSION = '1.6.6';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -653,23 +653,28 @@
     if (!jd || jd.length < 30) { toast('请先在「JD」页抓取或粘贴岗位信息', 'err'); UI.switchTab('jd'); return; }
     if (!resume || resume.length < 50) { toast('请先在「简历」页上传或粘贴简历', 'err'); UI.switchTab('resume'); return; }
 
+    // === RAG 增强：检索岗位理解 + 适配度分析作为额外上下文 ===
+    const jdExplain = getStore(STORE_KEYS.jdExplain, '');
+    const jdFit = getStore(STORE_KEYS.jdFit, '');
+    const rag = ragRetrieve(jd.slice(0, 200), 3); // 用 JD 开头检索相关知识
+
+    const sysParts = [
+      '你是一位资深猎头与简历优化专家，精通 HR 筛选简历的逻辑。',
+      '请根据目标岗位 JD 优化用户简历，严格遵守：',
+      '1. 只重组、突出、润色用户已有的真实经历，严禁虚构任何学历、公司、项目、数据；',
+      '2. 把与 JD 匹配的关键词、技能、经历前置并加重；',
+      '3. 用「动词 + 做了什么 + 量化结果」的 STAR 风格改写工作与项目经历；',
+      '4. 输出为结构清晰的 Markdown 简历，包含：基本信息占位、求职意向（对齐该岗位）、核心优势（3~5条，逐条对应 JD 要求）、工作经历、项目经历、技能清单；',
+      '5. 直接输出简历正文，不要任何解释性开场白和结尾。'
+    ];
+
+    // 如果有 RAG 检索到的适配度/岗位理解信息，加入 system prompt
+    if (jdFit) sysParts.push('\n【岗位适配度分析参考】\n' + jdFit.slice(0, 1500) + '\n\n请针对适配度分析中提到的「差距」和「优化建议」重点优化简历。');
+    if (jdExplain) sysParts.push('\n【岗位需求理解参考】\n' + jdExplain.slice(0, 1000) + '\n\n请确保简历覆盖岗位需求理解中提到的核心技能和素质要求。');
+
     const messages = [
-      {
-        role: 'system',
-        content: [
-          '你是一位资深猎头与简历优化专家，精通 HR 筛选简历的逻辑。',
-          '请根据目标岗位 JD 优化用户简历，严格遵守：',
-          '1. 只重组、突出、润色用户已有的真实经历，严禁虚构任何学历、公司、项目、数据；',
-          '2. 把与 JD 匹配的关键词、技能、经历前置并加重；',
-          '3. 用「动词 + 做了什么 + 量化结果」的 STAR 风格改写工作与项目经历；',
-          '4. 输出为结构清晰的 Markdown 简历，包含：基本信息占位、求职意向（对齐该岗位）、核心优势（3~5条，逐条对应 JD 要求）、工作经历、项目经历、技能清单；',
-          '5. 直接输出简历正文，不要任何解释性开场白和结尾。'
-        ].join('\n')
-      },
-      {
-        role: 'user',
-        content: `${jd}\n\n【我的原始简历】\n${resume}`
-      }
+      { role: 'system', content: sysParts.join('\n') },
+      { role: 'user', content: `${jd}\n\n【我的原始简历】\n${resume}` }
     ];
 
     callLLM(messages, (content) => {
@@ -813,6 +818,124 @@
     return { text: best, debug: debug.join(' | ') };
   }
 
+  /* ============================================================
+   * RAG 检索增强：把 JD / 简历 / 岗位理解 / 适配度分析 切块后，
+   * 根据 HR 问题检索最相关的片段，提供给 LLM 生成精准回复。
+   * ============================================================ */
+
+  // 文档切块：按段落/固定长度切，保留上下文重叠
+  function chunkText(text, size, overlap) {
+    size = size || 300; overlap = overlap || 50;
+    const chunks = [];
+    const clean = cleanText(text || '');
+    if (clean.length <= size) { if (clean) chunks.push(clean); return chunks; }
+    let i = 0;
+    while (i < clean.length) {
+      let end = Math.min(i + size, clean.length);
+      // 尽量在句号/换行处断开
+      if (end < clean.length) {
+        const dot = clean.lastIndexOf('。', end);
+        const brk = clean.lastIndexOf('\n', end);
+        const cut = Math.max(dot, brk);
+        if (cut > i + size * 0.5) end = cut + 1;
+      }
+      const chunk = clean.slice(i, end).trim();
+      if (chunk) chunks.push(chunk);
+      i = end - overlap;
+    }
+    return chunks;
+  }
+
+  // 计算查询与文本的相关性分数（TF-IDF 简化 + 关键词覆盖 + 语义近似）
+  function scoreRelevance(query, text) {
+    if (!query || !text) return 0;
+    const qTokens = tokenizeUnique(query);
+    const tTokens = tokenizeUnique(text);
+    let score = 0;
+    let matched = 0;
+    qTokens.forEach((qt) => {
+      if (tTokens.has(qt)) { score += 2; matched++; }
+      else {
+        // 子串匹配（如"Java"匹配"Java后端"）
+        for (const tt of tTokens) {
+          if (tt.includes(qt) || qt.includes(tt)) { score += 1; break; }
+        }
+      }
+    });
+    // 覆盖度加权（查询词被命中的比例越高越好）
+    const coverage = qTokens.size ? matched / qTokens.size : 0;
+    score += coverage * 5;
+    // 归一化到 0~100
+    return Math.min(100, Math.round(score * 10));
+  }
+
+  // 去重分词
+  function tokenizeUnique(s) {
+    const set = new Set();
+    const clean = String(s || '').toLowerCase();
+    // 英文词
+    const eng = clean.match(/[a-z][a-z0-9\+#\.]{1,}/g) || [];
+    eng.forEach((w) => set.add(w));
+    // 中文 2~3 字 n-gram
+    const cjk = clean.replace(/[^\u4e00-\u9fa5]/g, '');
+    for (let i = 0; i < cjk.length; i++) {
+      if (i + 2 <= cjk.length) set.add(cjk.slice(i, i + 2));
+      if (i + 3 <= cjk.length) set.add(cjk.slice(i, i + 3));
+    }
+    return set;
+  }
+
+  // RAG 主函数：从所有知识源检索与 HR 问题最相关的 Top-K 片段
+  function ragRetrieve(hrQuestion, topK) {
+    topK = topK || 5;
+    const query = cleanText(hrQuestion || '');
+    if (!query) return { context: '', sources: [] };
+
+    // 收集所有知识源
+    const sources = [];
+    const jd = getStore(STORE_KEYS.jd, '');
+    const resume = getStore(STORE_KEYS.resume, '');
+    const jdExplain = getStore(STORE_KEYS.jdExplain, '');
+    const jdFit = getStore(STORE_KEYS.jdFit, '');
+    const optimized = getStore(STORE_KEYS.optimized, '');
+    const prevQ = getStore(STORE_KEYS.hrQuestion, '');
+    const prevA = getStore(STORE_KEYS.hrReply, '');
+
+    if (jd) sources.push({ name: '岗位 JD', text: jd, weight: 1.5 });
+    if (optimized) sources.push({ name: '优化后简历', text: optimized, weight: 1.8 });
+    else if (resume) sources.push({ name: '原始简历', text: resume, weight: 1.5 });
+    if (jdExplain) sources.push({ name: '岗位需求理解', text: jdExplain, weight: 1.3 });
+    if (jdFit) sources.push({ name: '岗位适配度分析', text: jdFit, weight: 1.2 });
+    if (prevQ && prevA) sources.push({ name: '上一轮 HR 对话', text: 'HR问：' + prevQ + '\n候选人答：' + prevA, weight: 1.0 });
+
+    if (!sources.length) return { context: '', sources: [] };
+
+    // 切块 + 评分
+    const allChunks = [];
+    sources.forEach((src) => {
+      const chunks = chunkText(src.text, 300, 50);
+      chunks.forEach((chunk, ci) => {
+        const sc = scoreRelevance(query, chunk) * src.weight;
+        allChunks.push({ text: chunk, source: src.name, chunkIdx: ci, score: sc });
+      });
+    });
+
+    // 按分数排序取 Top-K，去重（相邻同来源片段合并）
+    allChunks.sort((a, b) => b.score - a.score);
+    const top = allChunks.slice(0, topK);
+
+    // 构建上下文（带来源标注）
+    let context = '';
+    const usedSources = [];
+    top.forEach((c) => {
+      if (c.score < 2) return; // 过滤低相关
+      context += '【' + c.source + '】' + c.text + '\n\n';
+      if (!usedSources.includes(c.source)) usedSources.push(c.source);
+    });
+
+    return { context: context.trim(), sources: usedSources, chunks: top };
+  }
+
   function generateHrReply(opts = {}) {
     if (!isPro('greeting')) { showLicenseModal('greeting', () => generateHrReply(opts)); return; }
     const optimized = getStore(STORE_KEYS.optimized, '');
@@ -832,31 +955,45 @@
       question = v.trim();
     }
     setStore(STORE_KEYS.hrQuestion, question);
-    if (!opts.silent) UI.showStatus('brh-chat', 'AI 正在结合优化后的简历生成针对性回复…');
+    if (!opts.silent) UI.showStatus('brh-chat', '正在 RAG 检索相关知识…');
 
+    // === RAG 增强：从 JD/简历/岗位理解/适配度 检索与 HR 问题最相关的片段 ===
+    const rag = ragRetrieve(question, 5);
+
+    // 构建带 RAG 上下文的 system prompt
     const sys = [
-      '你是一位帮助求职者与 HR 沟通的顾问。根据 HR 的最新提问，用候选人的第一人称写一条 Boss 直聘回复。',
+      '你是一位帮助求职者与 HR 沟通的顾问。根据 HR 的最新提问，结合下面【检索到的相关知识】，用候选人的第一人称写一条 Boss 直聘回复。',
       '严格遵守：',
-      '1. 只使用【优化后简历】里真实存在的经历与数据，严禁编造；',
-      '2. 只回答 HR 问到的点（可顺带 1 句优势补充），不要泛泛自我介绍；',
-      '3. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
-      '4. 如果 HR 的问题涉及简历未覆盖的信息（如到岗时间、期望薪资），给出得体的通用答法并提醒用户按实际情况确认；',
-      '5. 只输出回复正文，不要引号、前缀和解释。'
+      '1. 只使用【检索到的相关知识】里真实存在的经历与数据，严禁编造；',
+      '2. 优先依据「岗位适配度分析」和「岗位需求理解」来回答，体现你对该岗位的深入理解；',
+      '3. 结合「优化后简历」中与 HR 问题最相关的具体经历/数据来佐证，不要泛泛自我介绍；',
+      '4. 如果 HR 问了岗位相关但简历未覆盖的信息（如到岗时间、期望薪资），结合 JD 要求给出得体答法并提醒用户按实际情况确认；',
+      '5. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '6. 只输出回复正文，不要引号、前缀和解释。'
     ].join('\n');
+
+    // 构建 user prompt：RAG 检索结果 + HR 问题
+    let userContent = '';
+    if (rag.context) {
+      userContent += '【检索到的相关知识（RAG）】\n' + rag.context + '\n\n';
+    } else {
+      // RAG 无结果时兜底：使用完整文档
+      userContent += '【目标岗位 JD】\n' + jd.slice(0, 2000) + '\n\n';
+      userContent += '【优化后简历】\n' + optimized.slice(0, 6000) + '\n\n';
+    }
+    userContent += '【HR 的最新提问】\n' + question;
+
     const messages = [
       { role: 'system', content: sys },
-      { role: 'user', content: [
-        jd ? `【目标岗位 JD】\n${jd.slice(0, 2000)}` : '',
-        `【优化后简历】\n${optimized.slice(0, 6000)}`,
-        `【HR 的最新提问】\n${question}`
-      ].filter(Boolean).join('\n\n') }
+      { role: 'user', content: userContent }
     ];
 
+    const srcInfo = rag.sources.length ? '（RAG 来源：' + rag.sources.join(' / ') + '）' : '';
     callLLM(messages, (content) => {
       setStore(STORE_KEYS.hrReply, content);
       UI.renderHrReply(content, question);
-      UI.showStatus('brh-chat', '✅ 回复已生成，检查后可填入聊天框', 'ok');
-      if (!opts.silent) toast('针对 HR 提问的回复已生成', 'ok');
+      UI.showStatus('brh-chat', '✅ 回复已生成' + srcInfo + '，检查后可填入聊天框', 'ok');
+      if (!opts.silent) toast('针对 HR 提问的回复已生成' + srcInfo, 'ok');
     }, 'brh-chat');
   }
 
@@ -1256,7 +1393,7 @@
       ? `<div class="rs-head">${inlineMd(head)}</div>`
       : '';
     /* 水印层插在 .rs-wrap 内部（absolute 定位以简历纸面为参照） */
-    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}">${wmHtml}${inner}</div>`;
+    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}"><style>${style}</style>${wmHtml}${inner}</div>`;
     const body = theme === 'business'
       ? withWm('rs-business', `
            <div class="rs-side">
@@ -1318,7 +1455,7 @@
            ${sectionsHtml}${foot}
          `);
 
-    return `<style>${style}</style>${body}`;
+    return body;
   }
 
   /* ------------------------------------------------------------------
@@ -1364,11 +1501,9 @@
     if (!content) { toast('还没有优化简历，请先点击「开始优化」', 'err'); return Promise.reject(new Error('no-content')); }
     const theme = opts.theme || getResumeTheme();
     const scale = opts.scale || 2;
-    // 售卖版激活后会在导出物上带溯源水印（免费版无此函数，为空）
     const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
     const html = buildResumeHTML(content, theme, { watermark: wm });
 
-    // ① 挂到离屏容器（注意：html 第一个子元素是 <style>，真实纸面是 .rs-wrap，别量错对象）
     const host = document.createElement('div');
     host.style.cssText = 'position:fixed;left:-10000px;top:0;width:794px;z-index:-1;pointer-events:none;';
     host.innerHTML = html;
@@ -1378,7 +1513,6 @@
 
     const cleanup = () => { if (host.parentNode) host.parentNode.removeChild(host); };
 
-    // ② html2canvas：直接读 DOM 绘制，不经过 data: 图片，不受 CSP 影响
     const tryH2C = () => {
       const lib = (typeof html2canvas !== 'undefined') ? html2canvas
         : (typeof window !== 'undefined' && window.html2canvas);
@@ -1388,7 +1522,6 @@
         width: 794, windowWidth: 794
       });
     };
-    // ③ 兜底：SVG foreignObject
     const trySvg = () => nodeToCanvas(paper(), 794, h, scale);
 
     return tryH2C()
