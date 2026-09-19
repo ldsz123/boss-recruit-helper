@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boss招聘小助手 · 授权激活中心</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px 16px 60px;background:#f1f5f9;color:#0f172a;
+       font:15px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}
+  .wrap{max-width:720px;margin:0 auto}
+  .card{background:#fff;border-radius:16px;padding:22px;margin-bottom:16px;box-shadow:0 1px 3px rgba(15,23,42,.08)}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#64748b;font-size:13px;margin-bottom:18px}
+  .tabs{display:flex;gap:6px;background:#e2e8f0;padding:4px;border-radius:10px;margin-bottom:16px}
+  .tabs button{flex:1;height:36px;border:0;border-radius:8px;background:transparent;color:#475569;
+               font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+  .tabs button.on{background:#fff;color:#2563eb;box-shadow:0 1px 3px rgba(15,23,42,.12)}
+  label{display:block;font-size:13px;font-weight:600;color:#334155;margin:14px 0 6px}
+  input,select,textarea{width:100%;height:42px;padding:0 12px;border:1px solid #cbd5e1;border-radius:10px;
+        font-size:15px;outline:none;background:#fff;color:#0f172a;font-family:inherit}
+  textarea{height:auto;min-height:120px;padding:10px 12px;font-size:12.5px;line-height:1.7;
+           font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+  input:focus,select:focus,textarea:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+  .btn{height:42px;padding:0 18px;border:0;border-radius:10px;background:#2563eb;color:#fff;
+       font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
+  .btn:hover{background:#1d4ed8}
+  .btn.ghost{background:#fff;color:#334155;border:1px solid #cbd5e1}
+  .btn.ghost:hover{background:#f8fafc}
+  .btn.sm{height:34px;padding:0 12px;font-size:13px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .res{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:14px;display:none}
+  .res.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#15803d}
+  .res.bad{display:block;background:#fef2f2;border:1px solid #fecaca;color:#dc2626}
+  .steps{counter-reset:s;margin:6px 0 0;padding:0;list-style:none}
+  .steps li{counter-increment:s;position:relative;padding:8px 0 8px 34px;color:#475569;font-size:14px;border-bottom:1px dashed #e2e8f0}
+  .steps li:last-child{border-bottom:0}
+  .steps li::before{content:counter(s);position:absolute;left:0;top:8px;width:22px;height:22px;border-radius:50%;
+        background:#2563eb;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  code{background:#f1f5f9;padding:2px 6px;border-radius:5px;font-size:13px;color:#0f172a;word-break:break-all}
+  .tip{font-size:13px;color:#64748b;margin-top:8px}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+  .tag.g{background:#dcfce7;color:#15803d}
+  .tag.r{background:#fee2e2;color:#dc2626}
+  .kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #f1f5f9;font-size:14px}
+  .kv:last-child{border-bottom:0}
+  .kv span:first-child{color:#64748b;flex:0 0 auto}
+  .kv span:last-child{text-align:right}
+  .dev{background:#0f172a;color:#38bdf8;border-radius:12px;padding:14px 16px;text-align:center;
+       font:20px/1.4 ui-monospace,Menlo,Consolas,monospace;letter-spacing:3px;user-select:all}
+  .hide{display:none}
+  footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card">
+    <h1>🔑 Boss招聘小助手 · 授权激活中心</h1>
+    <div class="sub">激活后按授权档位解锁：AI 简历优化 · 岗位扫描匹配 · AI 话术生成 · PDF / 图片导出 · 简历发送</div>
+    <div class="tabs">
+      <button id="tab-activate" class="on">激活凭证</button>
+      <button id="tab-buy">获取授权</button>
+    </div>
+
+    <!-- ============ 激活凭证 ============ -->
+    <div id="pane-activate">
+      <label>粘贴作者发给你的激活凭证（以 BRHT1. 开头，较长，请完整复制）</label>
+      <textarea id="token" placeholder="BRHT1.eyJ2IjoxLCJjIjoiQlJILS4uLiJ9.xxxxxxxx" spellcheck="false" autocomplete="off"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btn-verify">🔍 验证凭证</button>
+        <button class="btn ghost" id="btn-copy">复制凭证</button>
+        <button class="btn ghost" id="btn-clear">清空</button>
+      </div>
+      <div id="res" class="res"></div>
+      <div id="detail" class="card hide" style="box-shadow:none;border:1px solid #e2e8f0;margin-top:14px"></div>
+
+      <div style="margin-top:18px">
+        <label style="margin-top:0">验证通过后，在脚本里这样激活</label>
+        <ol class="steps">
+          <li>打开 <b>Boss 直聘</b> 任意页面，点右下角 💼 小助手面板</li>
+          <li>进入 <b>🔑 激活授权</b> 页签</li>
+          <li>把凭证完整粘贴到「激活凭证」框 → 点 <b>🔑 激活</b></li>
+          <li>看到绿色「✅ 已激活」即为成功，对应档位功能立即解锁</li>
+        </ol>
+        <div class="tip">还没装脚本？<a id="install-link" href="#" target="_blank">点这里安装授权版脚本</a>（需先安装 Tampermonkey 篡改猴）。</div>
+      </div>
+    </div>
+
+    <!-- ============ 获取授权 ============ -->
+    <div id="pane-buy" class="hide">
+      <label>① 本机设备指纹（购买后发给作者，用于签发绑定你设备的凭证）</label>
+      <div class="dev" id="dev-fp">--------</div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btn-copy-dev">📋 复制设备指纹</button>
+      </div>
+      <div class="tip">设备指纹由浏览器环境自动计算（不涉及任何个人隐私）。凭证与它一一绑定：<b>转发给别人也无法激活</b>；换电脑 / 重装系统后指纹变化，把新指纹发给作者即可免费换绑。</div>
+
+      <div id="buy-box"></div>
+      <div class="tip" id="buy-empty">作者还没配置购买方式，可直接联系卖家获取激活凭证。</div>
+
+      <div style="margin-top:18px">
+        <label style="margin-top:0">② 授权说明</label>
+        <div class="kv"><span>凭证格式</span><span><code>BRHT1.数据.签名</code>（作者私钥签发，无法伪造）</span></div>
+        <div class="kv"><span>有效期</span><span>永久 / 30 / 90 / 180 / 365 天，以凭证内标注为准</span></div>
+        <div class="kv"><span>功能档位</span><span>按购买档位开放对应功能，详见凭证验证结果</span></div>
+        <div class="kv"><span>防倒卖</span><span>一机一码绑定设备指纹；导出的 PDF / 图片带溯源水印</span></div>
+        <div class="kv"><span>换设备</span><span>把新设备指纹发给作者，免费换绑</span></div>
+        <div class="kv"><span>退款</span><span>虚拟商品，签发后不支持退款，请先试用免费版</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <footer>凭证请妥善保存，泄露可联系作者吊销重发 · Boss招聘小助手</footer>
+</div>
+
+<script>
+/* ================= 作者配置区（改这里后重新 build） ================= */
+var CONFIG = {
+  installUrl: 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js',
+  buy: [                                          // 购买方式：type 支持 wechat / qq / xianyu / link / text
+    // { type: 'wechat', label: '微信', value: 'your_wechat_id' },
+    // { type: 'xianyu', label: '闲鱼', value: 'https://www.goofish.com/...' }
+  ]
+};
+/* ======================================================= */
+
+/* ============================================================
+ * license-verify.js — Boss招聘小助手 · 授权凭证「只验不发」模块
+ *
+ * 本文件同时被以下两处使用（均不含私钥 / 短码密钥 / 发码算法，可公开分发）：
+ *   1) 油猴售卖版脚本（由 make-sell.js 注入，暴露 BRH_VERIFY）
+ *   2) 买家激活网页 activate.html（由 build-activate.js 内联）
+ *
+ * 授权机制（v2 · 非对称签名）：
+ *   - 作者在本地（admin.html）用「ECDSA P-256 私钥」为买家签发激活凭证：
+ *       BRHT1.<payload base64url>.<signature base64url>
+ *     payload = {"v":1,"c":"BRH-XXXX-XXXX-XXXX"(关联码,可空),"d":"设备指纹"(空=不绑设备),
+ *                "e":到期毫秒(0=永久),"f":["all"或功能数组],"i":签发毫秒,"o":备注(可空)}
+ *   - 脚本 / 激活页只内嵌「公钥」做本地验签 —— 买家拿不到私钥，无法伪造或自制凭证。
+ *   - 凭证绑定设备指纹：转发给他人时设备不匹配 → 拒绝激活（防倒卖）。
+ *   - 凭证自带功能档位（f 字段）：不同价位开放不同付费功能（功能权限）。
+ *
+ * ⚠️ 首次使用：先运行 sell-kit/keygen.js 生成密钥对，
+ *    把输出的公钥 JWK 粘贴到下方 BRH_PUB_KEY，然后重跑 make-sell.js / build-activate.js。
+ * ========================================================== */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.BRH_VERIFY = api;
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  /* ---------------- 作者公钥（可公开；换密钥需重跑构建） ----------------
+   * 由 sell-kit/keygen.js 生成后粘贴到这里（JWK 对象）。
+   * 为 null 时验签不可用，会明确提示作者尚未配置密钥。 */
+  var BRH_PUB_KEY = {"key_ops":["verify"],"ext":true,"kty":"EC","x":"4t6AIufRGx3Ufo6i0HboP1m_NsmdlsFtPPU3eQj5-F4","y":"s1d04TTl16PpwKIuP7vhB_xoYh9rbMi3CYUKZntdJx8","crv":"P-256"}; /* 例：{"kty":"EC","crv":"P-256","x":"...","y":"..."} */
+
+  /* ---------------- 凭证与格式 ---------------- */
+  var TOKEN_PREFIX = 'BRHT1.';
+  var OLD_CODE_RE = /^BRH-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$/;
+
+  function b64urlToBytes(s) {
+    var t = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    var bin = atob(t);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function utf8(str) {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+    var out = [], i, c;
+    for (i = 0; i < str.length; i++) {
+      c = str.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+      else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+    return new Uint8Array(out);
+  }
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function fmtDate(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+
+  /* ---------------- 跨场景小存储（油猴 GM / 网页 localStorage / 内存） ---------------- */
+  function stGet(key) {
+    try {
+      if (typeof GM_getValue === 'function') { var v = GM_getValue(key); return v == null ? null : v; }
+      if (typeof localStorage !== 'undefined') return localStorage.getItem(key);
+    } catch (e) {}
+    return (root.__BRH_MEM_STORE__ || {})[key] || null;
+  }
+  function stSet(key, val) {
+    try {
+      if (typeof GM_setValue === 'function') { GM_setValue(key, val); return; }
+      if (typeof localStorage !== 'undefined') {
+        if (val == null) localStorage.removeItem(key); else localStorage.setItem(key, String(val));
+        return;
+      }
+    } catch (e) {}
+    if (!root.__BRH_MEM_STORE__) root.__BRH_MEM_STORE__ = {};
+    root.__BRH_MEM_STORE__[key] = val;
+  }
+
+  /* ---------------- 设备指纹（脚本与激活页用同一算法，同一浏览器结果一致） ----------------
+   * 只取跨版本相对稳定的属性（刻意不含 UA 版本号），浏览器大改或换机才会变化；
+   * 变化后联系作者换发凭证即可（admin.html 支持重签）。 */
+  function deviceFingerprint() {
+    try {
+      var n = typeof navigator !== 'undefined' ? navigator : {};
+      var s = typeof screen !== 'undefined' ? screen : {};
+      var parts = [
+        n.platform || '', n.language || '',
+        (function () { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; } })(),
+        s.width + 'x' + s.height + '@' + (s.colorDepth || ''),
+        (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1),
+        n.hardwareConcurrency || '',
+        n.deviceMemory || '',
+        n.maxTouchPoints || 0
+      ].join('|');
+      var h1 = 0x811c9dc5, h2 = 0xc2b2ae35, i;
+      for (i = 0; i < parts.length; i++) {
+        h1 = ((h1 ^ parts.charCodeAt(i)) * 16777619) >>> 0;
+        h2 = ((h2 + parts.charCodeAt(i) * (i + 7)) * 2654435761) >>> 0;
+      }
+      return ('0000000' + h1.toString(16)).slice(-8).toUpperCase() + ('0000000' + h2.toString(16)).slice(-8).toUpperCase();
+    } catch (e) { return 'FFFFFFFFFFFFFFFF'; }
+  }
+
+  /** 稳定的本机设备标识（首次生成随机 UUID 存本地，用于本地自检展示） */
+  function deviceId() {
+    var k = 'brh_device_uuid';
+    var v = stGet(k);
+    if (!v) {
+      v = '';
+      try {
+        var arr = new Uint8Array(16);
+        (typeof crypto !== 'undefined' && crypto.getRandomValues) ? crypto.getRandomValues(arr)
+          : (function () { for (var i = 0; i < 16; i++) arr[i] = Math.floor(Math.random() * 256); })();
+        for (var i = 0; i < 16; i++) v += (arr[i] | 0x100).toString(16).slice(1);
+      } catch (e) { v = String(Date.now()) + Math.random().toString(16).slice(2); }
+      stSet(k, v);
+    }
+    return v;
+  }
+
+  /** 买家报给作者的「设备指纹」（8+8 位，签发时绑定用） */
+  function deviceShortId() { return deviceFingerprint(); }
+
+  /* ---------------- 凭证解析（同步，不验签名，仅用于 UI 预览 / 预检） ---------------- */
+  function parseTokenInfo(raw) {
+    var token = String(raw == null ? '' : raw).trim().replace(/\s+/g, '');
+    if (OLD_CODE_RE.test(token.toUpperCase())) {
+      return { kind: 'old-code', ok: false, code: token.toUpperCase(),
+        reason: '这是旧版激活码。授权机制已升级为「激活凭证」，请联系作者换发（把设备指纹发给作者即可）。' };
+    }
+    if (token.indexOf(TOKEN_PREFIX) !== 0) {
+      return { kind: 'unknown', ok: false, reason: '格式不正确：激活凭证应以 BRHT1. 开头（从作者消息中完整复制，含 BRHT1. 前缀）' };
+    }
+    var rest = token.slice(TOKEN_PREFIX.length);
+    var dot = rest.lastIndexOf('.');
+    if (dot < 0) return { kind: 'token', ok: false, reason: '凭证不完整（缺少签名段），请完整复制' };
+    var payloadB64 = rest.slice(0, dot);
+    var sigB64 = rest.slice(dot + 1);
+    var p;
+    try { p = JSON.parse(new TextDecoder('utf-8').decode(b64urlToBytes(payloadB64))); }
+    catch (e) { return { kind: 'token', ok: false, reason: '凭证内容损坏，请完整重新复制' }; }
+    var exp = p.e || 0;
+    var expired = !!exp && Date.now() > exp;
+    return {
+      kind: 'token', ok: !expired, expired: expired,
+      token: token, payload: p, sigB64: sigB64,
+      code: p.c || '', device: p.d || '', features: p.f || ['all'],
+      exp: exp, iat: p.i || 0, note: p.o || '',
+      expText: exp ? ('有效期至 ' + fmtDate(new Date(exp))) : '永久有效',
+      reason: expired ? ('凭证已过期（' + fmtDate(new Date(exp)) + '），请联系作者续期') : ''
+    };
+  }
+
+  /** 更新验签公钥（admin.html 生成密钥对后立即生效；构建时也可用字符串替换预置） */
+  function setPublicJwk(jwk) { BRH_PUB_KEY = jwk; }
+  function getPublicJwk() { return BRH_PUB_KEY; }
+  function checkFormat(raw) {
+    var t = String(raw == null ? '' : raw).trim();
+    if (!t) return { ok: false, reason: '未填写' };
+    var info = parseTokenInfo(t);
+    if (info.kind === 'old-code') return { ok: false, oldCode: true, reason: info.reason };
+    return info.ok ? { ok: true } : { ok: false, reason: info.reason || '格式不正确' };
+  }
+
+  /* ---------------- ECDSA P-256 验签（WebCrypto，异步） ---------------- */
+  function subtle() {
+    if (typeof crypto !== 'undefined' && crypto.subtle) return crypto.subtle;
+    if (root.__BRH_NODE_SUBTLE__) return root.__BRH_NODE_SUBTLE__;
+    return null;
+  }
+
+  /**
+   * 完整验证：验签 + 过期 + （可选）设备绑定检查
+   * @returns {Promise<{ok:boolean, reason?:string, info?:object}>}
+   */
+  function verifyToken(raw, opts) {
+    opts = opts || {};
+    return new Promise((resolve) => {
+      var info = parseTokenInfo(raw);
+      if (!info.ok && info.kind !== 'token') return resolve({ ok: false, reason: info.reason });
+      if (info.ok === false && info.expired) return resolve({ ok: false, reason: info.reason, info });
+      if (!BRH_PUB_KEY) return resolve({ ok: false, reason: '作者尚未配置验签公钥（BRH_PUB_KEY），请更新脚本/激活页' });
+      var s = subtle();
+      if (!s) return resolve({ ok: false, reason: '当前环境不支持 WebCrypto（需 HTTPS 或本地 file:// 打开）' });
+      var pubJwk = (typeof BRH_PUB_KEY === 'string') ? JSON.parse(BRH_PUB_KEY) : BRH_PUB_KEY;
+      var token = info.token;
+      var rest = token.slice(TOKEN_PREFIX.length);
+      var signedPart = utf8(rest.slice(0, rest.lastIndexOf('.')));
+      var sigBytes = b64urlToBytes(info.sigB64);
+      s.importKey('jwk', pubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+        .then((key) => s.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sigBytes, signedPart))
+        .then((good) => {
+          if (!good) return resolve({ ok: false, reason: '凭证签名无效（可能被篡改或伪造）', info });
+          if (!opts.skipDevice) {
+            if (info.device && info.device !== deviceFingerprint()) {
+              return resolve({ ok: false, deviceMismatch: true, reason: '该凭证绑定了其他设备（指纹 ' + info.device.slice(0, 8) + '…）。本机指纹 ' + deviceShortId() + '，请把它发给作者换发。', info });
+            }
+          }
+          resolve({ ok: true, info });
+        })
+        .catch((e) => resolve({ ok: false, reason: '验签失败：' + (e && e.message || e) }));
+    });
+  }
+
+  /** 功能清单（与脚本内 GUARD_FEATURES 对应） */
+  var FEATURE_KEYS = ['optimize', 'match', 'greeting', 'export', 'send'];
+  var FEATURE_NAMES = {
+    optimize: 'AI 简历优化', match: '岗位扫描匹配', greeting: 'AI 话术生成',
+    export: 'PDF / 图片导出', send: '简历图片发送', all: '全部功能'
+  };
+  function featureText(features) {
+    if (!features || features.indexOf('all') >= 0) return '全部功能（专业版）';
+    return features.map((f) => FEATURE_NAMES[f] || f).join('、') || '未指定';
+  }
+  function hasFeature(features, key) {
+    return !!features && (features.indexOf('all') >= 0 || features.indexOf(key) >= 0);
+  }
+
+  return {
+    PUB_KEY: BRH_PUB_KEY,
+    TOKEN_PREFIX: TOKEN_PREFIX,
+    FEATURE_KEYS: FEATURE_KEYS,
+    FEATURE_NAMES: FEATURE_NAMES,
+    featureText: featureText,
+    hasFeature: hasFeature,
+    parseTokenInfo: parseTokenInfo,
+    checkFormat: checkFormat,
+    verifyToken: verifyToken,
+    setPublicJwk: setPublicJwk,
+    getPublicJwk: getPublicJwk,
+    deviceFingerprint: deviceFingerprint,
+    deviceShortId: deviceShortId,
+    deviceId: deviceId,
+    fmtDate: fmtDate,
+    stGet: stGet,
+    stSet: stSet
+  };
+});
+
+
+var V = window.BRH_VERIFY;
+
+/* ---------- Tab 切换 ---------- */
+function switchTab(name) {
+  ['activate', 'buy'].forEach(function (n) {
+    document.getElementById('pane-' + n).classList.toggle('hide', n !== name);
+    document.getElementById('tab-' + n).classList.toggle('on', n === name);
+  });
+}
+document.getElementById('tab-activate').onclick = function () { switchTab('activate'); };
+document.getElementById('tab-buy').onclick = function () { switchTab('buy'); };
+
+/* ---------- 安装链接 ---------- */
+document.getElementById('install-link').href = CONFIG.installUrl;
+
+/* ---------- 设备指纹 ---------- */
+var FP = V.deviceShortId();
+document.getElementById('dev-fp').textContent = FP;
+document.getElementById('btn-copy-dev').onclick = function () {
+  var btn = this, t = btn.textContent;
+  function done() { btn.textContent = '✅ 已复制'; setTimeout(function () { btn.textContent = t; }, 1400); }
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(FP).then(done, done);
+  else { fallbackCopy(FP); done(); }
+};
+
+/* ---------- 购买方式渲染 ---------- */
+(function () {
+  var box = document.getElementById('buy-box');
+  var empty = document.getElementById('buy-empty');
+  var list = (CONFIG.buy || []).filter(function (b) { return b && b.value; });
+  if (!list.length) { box.classList.add('hide'); return; }
+  empty.classList.add('hide');
+  var icon = { wechat: '💬', qq: '🐧', xianyu: '🐟', link: '🔗', text: '📝' };
+  box.innerHTML = '<label style="margin-top:18px">③ 购买 / 联系方式</label>' + list.map(function (b) {
+    var v = b.value;
+    var copyable = b.type !== 'link';
+    return '<div class="kv"><span>' + (icon[b.type] || '•') + ' ' + b.label + '</span>' +
+      '<span><code id="buy-' + b.label + '">' + v + '</code>' +
+      (copyable ? ' <button class="btn ghost sm" data-copy="' + v + '">复制</button>' : ' <a href="' + v + '" target="_blank">打开</a>') +
+      '</span></div>';
+  }).join('');
+  box.addEventListener('click', function (e) {
+    var v = e.target.getAttribute && e.target.getAttribute('data-copy');
+    if (v) { fallbackCopy(v); e.target.textContent = '已复制'; setTimeout(function () { e.target.textContent = '复制'; }, 1200); }
+  });
+})();
+
+/* ---------- 复制工具 ---------- */
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+/* ---------- 验证凭证（本地公钥验签 + 设备绑定 + 有效期 + 功能档位） ---------- */
+var res = document.getElementById('res');
+var detail = document.getElementById('detail');
+function kvRow(k, v) { return '<div class="kv"><span>' + k + '</span><span>' + v + '</span></div>'; }
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function verify() {
+  var v = document.getElementById('token').value.trim();
+  detail.classList.add('hide');
+  if (!v) { res.className = 'res bad'; res.textContent = '请先粘贴激活凭证'; return; }
+  if (/^BRH-/i.test(v) && v.indexOf('BRHT1.') !== 0) {
+    res.className = 'res bad';
+    res.innerHTML = '❌ 这是旧版激活码。授权机制已升级为「激活凭证 + 设备绑定」：<br>' +
+      '把你的设备指纹 <code>' + FP + '</code> 发给作者，即可免费换发新凭证。';
+    return;
+  }
+  res.style.display = 'block';
+  res.style.background = '#eff6ff';
+  res.style.border = '1px solid #bfdbfe';
+  res.style.color = '#1d4ed8';
+  res.textContent = '⏳ 正在本地验签（ECDSA P-256）…';
+
+  V.verifyToken(v).then(function (r) {
+    if (!r.ok) {
+      res.className = 'res bad';
+      res.innerHTML = '❌ ' + escHtml(r.reason || '凭证无效') +
+        '<div class="tip" style="color:#dc2626">请确认完整复制（含 BRHT1. 前缀与签名段）；仍不行请联系卖家补发。</div>';
+      return;
+    }
+    var p = r.info;
+    res.className = 'res ok';
+    res.innerHTML = '✅ <b>凭证有效</b> · ' + escHtml(p.expText) +
+      '<div class="tip" style="color:#15803d">请到 Boss 页面 → 💼 面板 → 🔑 激活授权 → 粘贴激活。</div>';
+    detail.innerHTML =
+      kvRow('验签', '<span class="tag g">ECDSA P-256 签名有效</span>') +
+      kvRow('有效期', escHtml(p.expText)) +
+      kvRow('功能档位', escHtml(V.featureText(p.features))) +
+      (p.code ? kvRow('关联订单码', '<code>' + escHtml(p.code) + '</code>') : '') +
+      kvRow('设备绑定', p.device ? ('<span class="tag ' + (p.device === FP ? 'g' : 'r') + '">' +
+        (p.device === FP ? '已绑定本机 ✓' : '绑定其他设备（本页指纹 ' + FP + '）') + '</span>') : '<span class="tag g">未绑定（任何设备可用）</span>') +
+      (p.note ? kvRow('备注', escHtml(p.note)) : '');
+    detail.classList.remove('hide');
+  });
+}
+document.getElementById('btn-verify').onclick = verify;
+document.getElementById('token').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); verify(); }
+});
+document.getElementById('btn-copy').onclick = function () {
+  var v = document.getElementById('token').value.trim();
+  if (!v) { res.className = 'res bad'; res.textContent = '还没有粘贴凭证'; return; }
+  fallbackCopy(v);
+  this.textContent = '已复制'; var b = this; setTimeout(function () { b.textContent = '复制凭证'; }, 1200);
+};
+document.getElementById('btn-clear').onclick = function () {
+  document.getElementById('token').value = '';
+  res.className = 'res'; detail.classList.add('hide');
+};
+
+</script>
+</body>
+</html>
