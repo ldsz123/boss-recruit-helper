@@ -2580,6 +2580,8 @@
 
   /** 买家激活中心网页（「获取授权」按钮会打开它） */
   const LICENSE_PAGE = 'https://ldsz123.github.io/boss-recruit-helper/activate.html';
+  /** 手机号发货后端 API（deliver.html 和插件内置手机号验证共用）。留空 = 仅支持粘贴授权码 */
+  const DELIVER_API = 'https://your-server.com';  // 部署后改为你的服务器地址
   /** 可选：远程授权接口（license-server-example.js）。留空 = 纯离线验签 */
   const LICENSE_API = '';
 
@@ -2708,58 +2710,135 @@
     document.querySelectorAll('#brh-lic-mask').forEach((n) => n.remove());
     const feat = GUARD_FEATURES[featureKey] || '该功能';
     const s = licState();
-    const tip = s.ok
-      ? ('当前授权档位未包含「<b>' + esc(feat) + '</b>」。如需解锁，请联系作者升级授权（设备指纹 ' + deviceTag() + '）。')
-      : ('「<b>' + esc(feat) + '</b>」是授权版专属功能。购买后把下方设备指纹发给作者，收到 BRHT1. 开头的激活凭证后粘贴到这里即可。');
+    let curToken = s.code || '';
+
     const mask = document.createElement('div');
     mask.id = 'brh-lic-mask';
-    mask.innerHTML = `
-      <div id="brh-lic-box" style="background:#fff;border-radius:14px;max-width:460px;width:100%;padding:20px 18px;
-           box-shadow:0 20px 60px rgba(0,0,0,.28);font:14px/1.65 -apple-system,'Microsoft YaHei',sans-serif;color:#0f172a">
-        <div style="font-size:16px;font-weight:700;margin-bottom:6px">🔒 需要授权</div>
-        <div style="color:#475569;margin-bottom:10px">${tip}</div>
-        <div style="background:#f1f5f9;border-radius:8px;padding:8px 10px;font-size:12px;color:#475569;margin-bottom:10px">
-          本机设备指纹：<b style="user-select:all;letter-spacing:1px">${deviceTag()}</b>
-          <button id="brh-lic-copydev" style="float:right;border:0;background:#e2e8f0;border-radius:6px;padding:2px 8px;cursor:pointer;font-size:12px">复制</button>
-        </div>
-        <textarea id="brh-lic-input" placeholder="粘贴激活凭证：BRHT1.xxxx.xxxx（完整复制，较长）" spellcheck="false"
-               style="width:100%;box-sizing:border-box;height:84px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;
-                      font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace;resize:vertical;outline:none"></textarea>
-        <div id="brh-lic-st" style="min-height:18px;font-size:12px;color:#dc2626;margin-top:6px"></div>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button id="brh-lic-ok" style="flex:1;height:36px;border:0;border-radius:8px;background:#2563eb;color:#fff;
-                  font-size:14px;font-weight:600;cursor:pointer">立即激活</button>
-          <button id="brh-lic-buy" style="height:36px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;
-                  background:#fff;color:#334155;font-size:13px;cursor:pointer">获取授权</button>
-          <button id="brh-lic-x" style="height:36px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;
-                  background:#fff;color:#94a3b8;font-size:13px;cursor:pointer">取消</button>
-        </div>
-        <div style="margin-top:10px;font-size:12px;color:#94a3b8">凭证与设备一一绑定，转发给别人也无法激活；凭证请妥善保存，泄露可联系作者吊销重发。</div>
-      </div>`;
-    mask.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px';
-    document.body.appendChild(mask);
-    const input = mask.querySelector('#brh-lic-input');
-    const st = mask.querySelector('#brh-lic-st');
-    setTimeout(() => input && input.focus(), 50);
-    const close = () => mask.remove();
-    mask.querySelector('#brh-lic-x').onclick = close;
-    mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
-    mask.querySelector('#brh-lic-copydev').onclick = () => {
-      try { navigator.clipboard.writeText(deviceTag()); st.style.color = '#16a34a'; st.textContent = '设备指纹已复制，发给作者即可换发 / 续期'; } catch (e) {}
-    };
-    mask.querySelector('#brh-lic-buy').onclick = () => window.open(LICENSE_PAGE, '_blank');
-    const submit = () => {
-      st.style.color = '#64748b';
-      st.textContent = '验签中…';
-      saveLicense(input.value, (r) => {
-        if (!r || !r.ok) { st.style.color = '#dc2626'; st.textContent = '❌ ' + ((r && r.reason) || '激活失败'); return; }
-        close();
-        toast('✅ 激活成功' + (r.expText ? '（' + r.expText + '）' : ''), 'ok');
-        if (onOk) onOk();
-      });
-    };
-    mask.querySelector('#brh-lic-ok').onclick = submit;
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } });
+
+    function renderTab(tab) {
+      const tip = s.ok && tab === 'code'
+        ? ('当前授权档位未包含「<b>' + esc(feat) + '</b>」。如需解锁，请联系作者升级授权。')
+        : ('「<b>' + esc(feat) + '</b>」是授权版专属功能。选择「手机号验证」自助激活，或粘贴已有的授权码。');
+
+      let body = '';
+      if (tab === 'code') {
+        body = `
+          <textarea id="brh-lic-input" placeholder="粘贴授权码：BRHT1.xxxx.xxxx（完整复制）" spellcheck="false"
+                 style="width:100%;box-sizing:border-box;height:84px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;
+                        font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace;resize:vertical;outline:none">${esc(curToken)}</textarea>
+          <div id="brh-lic-st" style="min-height:18px;font-size:12px;color:#dc2626;margin-top:6px"></div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button id="brh-lic-ok" style="flex:1;height:36px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:14px;font-weight:600;cursor:pointer">立即激活</button>
+          </div>`;
+      } else {
+        body = `
+          <div style="margin-bottom:8px">
+            <label style="font-size:12px;color:#64748b">① 输入手机号</label>
+            <div style="display:flex;gap:6px;margin-top:4px">
+              <input id="brh-phone" type="tel" maxlength="11" placeholder="11位手机号" style="flex:1;height:38px;padding:0 10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px;outline:none">
+              <button id="brh-send-code" style="height:38px;padding:0 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:13px;cursor:pointer;white-space:nowrap">获取验证码</button>
+            </div>
+          </div>
+          <div style="margin-bottom:8px">
+            <label style="font-size:12px;color:#64748b">② 输入验证码</label>
+            <div style="display:flex;gap:6px;margin-top:4px">
+              <input id="brh-code" type="text" maxlength="6" placeholder="6位验证码" style="flex:1;height:38px;padding:0 10px;border:1px solid #cbd5e1;border-radius:8px;font-size:18px;text-align:center;letter-spacing:6px;outline:none">
+              <button id="brh-phone-ok" style="height:38px;padding:0 14px;border:0;border-radius:8px;background:#16a34a;color:#fff;font-size:13px;cursor:pointer;white-space:nowrap">验证激活</button>
+            </div>
+          </div>
+          <div id="brh-lic-st" style="min-height:18px;font-size:12px;color:#dc2626;margin-top:6px"></div>
+          ${DELIVER_API.includes('your-server') ? '<div style="font-size:11px;color:#94a3b8;margin-top:6px">⚠️ 请先联系作者部署手机号发货后端</div>' : ''}`;
+      }
+
+      mask.innerHTML = `
+        <div id="brh-lic-box" style="background:#fff;border-radius:14px;max-width:460px;width:100%;padding:20px 18px;
+             box-shadow:0 20px 60px rgba(0,0,0,.28);font:14px/1.65 -apple-system,'Microsoft YaHei',sans-serif;color:#0f172a">
+          <div style="font-size:16px;font-weight:700;margin-bottom:6px">🔒 需要授权</div>
+          <div style="color:#475569;margin-bottom:12px">${tip}</div>
+          <div style="display:flex;gap:6px;margin-bottom:12px;border-bottom:1px solid #e2e8f0">
+            <button id="brh-tab-phone" style="flex:1;padding:8px 0;border:0;background:transparent;font-size:13px;font-weight:600;cursor:pointer;border-bottom:2px solid ${tab === 'phone' ? '#2563eb' : 'transparent'};color:${tab === 'phone' ? '#2563eb' : '#64748b'}">📱 手机号验证</button>
+            <button id="brh-tab-code" style="flex:1;padding:8px 0;border:0;background:transparent;font-size:13px;font-weight:600;cursor:pointer;border-bottom:2px solid ${tab === 'code' ? '#2563eb' : 'transparent'};color:${tab === 'code' ? '#2563eb' : '#64748b'}">🔑 输入授权码</button>
+          </div>
+          ${body}
+          <div style="margin-top:10px;display:flex;gap:8px">
+            <button id="brh-lic-buy" style="flex:1;height:34px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;cursor:pointer">📖 激活指南</button>
+            <button id="brh-lic-x" style="height:34px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#94a3b8;font-size:13px;cursor:pointer">取消</button>
+          </div>
+        </div>`;
+      mask.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+      document.body.appendChild(mask);
+
+      // Tab 切换
+      mask.querySelector('#brh-tab-phone').onclick = () => renderTab('phone');
+      mask.querySelector('#brh-tab-code').onclick = () => renderTab('code');
+      mask.querySelector('#brh-lic-x').onclick = () => mask.remove();
+      mask.querySelector('#brh-lic-buy').onclick = () => window.open(LICENSE_PAGE, '_blank');
+      mask.addEventListener('click', (e) => { if (e.target === mask) mask.remove(); });
+
+      const st = mask.querySelector('#brh-lic-st');
+
+      if (tab === 'code') {
+        const input = mask.querySelector('#brh-lic-input');
+        setTimeout(() => input && input.focus(), 50);
+        const submit = () => {
+          st.style.color = '#64748b'; st.textContent = '验签中…';
+          saveLicense(input.value, (r) => {
+            if (!r || !r.ok) { st.style.color = '#dc2626'; st.textContent = '❌ ' + ((r && r.reason) || '激活失败'); return; }
+            mask.remove();
+            toast('✅ 激活成功' + (r.expText ? '（' + r.expText + '）' : ''), 'ok');
+            if (onOk) onOk();
+          });
+        };
+        mask.querySelector('#brh-lic-ok').onclick = submit;
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } });
+      } else {
+        // 手机号验证流程
+        const phoneInput = mask.querySelector('#brh-phone');
+        const codeInput = mask.querySelector('#brh-code');
+
+        mask.querySelector('#brh-send-code').onclick = async () => {
+          const phone = phoneInput.value.trim();
+          if (!/^1[3-9]\d{9}$/.test(phone)) { st.style.color = '#dc2626'; st.textContent = '❌ 手机号格式不正确'; return; }
+          st.style.color = '#64748b'; st.textContent = '发送中…';
+          try {
+            const r = await fetch(DELIVER_API + '/deliver/send-code', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone })
+            });
+            const j = await r.json();
+            if (j.ok) { st.style.color = '#16a34a'; st.textContent = '✅ 验证码已下发（演示模式：' + (j.devCode || '请查收短信') + '）'; codeInput.focus(); }
+            else { st.style.color = '#dc2626'; st.textContent = '❌ ' + (j.msg || '发送失败'); }
+          } catch (e) { st.style.color = '#dc2626'; st.textContent = '❌ 网络错误：' + e.message; }
+        };
+
+        mask.querySelector('#brh-phone-ok').onclick = async () => {
+          const phone = phoneInput.value.trim();
+          const code = codeInput.value.trim();
+          if (!/^1[3-9]\d{9}$/.test(phone)) { st.style.color = '#dc2626'; st.textContent = '❌ 请先输入正确手机号'; return; }
+          if (!/^\d{6}$/.test(code)) { st.style.color = '#dc2626'; st.textContent = '❌ 请输入6位验证码'; return; }
+          st.style.color = '#64748b'; st.textContent = '验证中…';
+          try {
+            const r = await fetch(DELIVER_API + '/deliver/issue', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone, code, features: ['all'] })
+            });
+            const j = await r.json();
+            if (j && j.token) {
+              curToken = j.token;
+              saveLicense(j.token, (sr) => {
+                if (!sr || !sr.ok) { st.style.color = '#dc2626'; st.textContent = '❌ ' + ((sr && sr.reason) || '激活失败'); return; }
+                mask.remove();
+                toast('✅ 手机号绑定激活成功！', 'ok');
+                if (onOk) onOk();
+              });
+            } else { st.style.color = '#dc2626'; st.textContent = '❌ ' + (j.msg || '验证失败'); }
+          } catch (e) { st.style.color = '#dc2626'; st.textContent = '❌ 网络错误：' + e.message; }
+        };
+
+        phoneInput.addEventListener('input', () => { phoneInput.value = phoneInput.value.replace(/\D/g, '').slice(0, 11); });
+        codeInput.addEventListener('input', () => { codeInput.value = codeInput.value.replace(/\D/g, '').slice(0, 6); });
+      }
+    }
+
+    renderTab('phone'); // 默认手机号验证
   }
 
   /** 付费功能守门：已激活且档位包含该功能 → 直接执行；否则弹激活框（成功后自动继续） */
