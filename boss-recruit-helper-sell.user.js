@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.6.6
+// @version      1.6.7
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -60,7 +60,7 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.6';
+  const VERSION = '1.6.7';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -2579,7 +2579,7 @@
    * ============================================================================== */
 
   /** 买家激活中心网页（「获取授权」按钮会打开它） */
-  const LICENSE_PAGE = 'https://zzc356.gitee.io/boss-recruit-helper/activate.html';
+  const LICENSE_PAGE = 'https://ldsz123.github.io/boss-recruit-helper/activate.html';
   /** 可选：远程授权接口（license-server-example.js）。留空 = 纯离线验签 */
   const LICENSE_API = '';
 
