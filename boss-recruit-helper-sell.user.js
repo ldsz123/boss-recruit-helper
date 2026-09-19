@@ -20,8 +20,8 @@
 // @connect      cdn.jsdelivr.net
 // @run-at       document-idle
 // @license      MIT
-// @updateURL    https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js
-// @downloadURL  https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper-sell.user.js
+// @updateURL    https://raw.githubusercontent.com/ldsz123/boss-recruit-helper/main/boss-recruit-helper-sell.user.js
+// @downloadURL  https://raw.githubusercontent.com/ldsz123/boss-recruit-helper/main/boss-recruit-helper-sell.user.js
 // ==/UserScript==
 
 (function () {
