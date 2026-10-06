@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.6.12
+// @version      1.11.0
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -256,17 +256,18 @@
       if (!title || title.length < 2) continue;
       const salary = txt($('.salary', w)) || txt($('.job-salary', w));
       const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w));
+      const scale = txt($('.company-scale', w)) || txt($('.scale', w)) || txt($('.company-size', w)) || txt($('.info-desc .scale', w)) || '';
       const area = txt($('.job-area', w)) || txt($('.job-area-wrapper', w)) || txt($('.city', w));
       const tags = $$('.tag-list .tag, .tag, .info-desc .tag', w).map(txt).filter(Boolean);
       const desc = txt($('.job-sec-text', w)) || txt($('.info-desc', w)) || txt($('.job-desc', w));
       const link = (titleEl && titleEl.href) ? titleEl : (w.querySelector('a') || null);
-      jobs.push({ el: w, title, salary, company, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
+      jobs.push({ el: w, title, salary, company, scale, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
     }
     return jobs;
   }
 
   function buildJdFromCard(job) {
-    const lines = [`【目标岗位】${job.title}${job.salary ? '　' + job.salary : ''}${job.company ? '　|　' + job.company : ''}${job.area ? '　' + job.area : ''}`];
+    const lines = [`【目标岗位】${job.title}${job.salary ? '　' + job.salary : ''}${job.company ? '　|　' + job.company : ''}${job.scale ? '　|　' + job.scale : ''}${job.area ? '　' + job.area : ''}`];
     if (job.tags.length) lines.push(`\n## 任职要求 / 岗位标签\n${job.tags.join('、')}`);
     if (job.desc) lines.push(`\n## 职位描述\n${job.desc}`);
     return lines.join('\n');
@@ -297,7 +298,7 @@
   function matchJobsAI(resume, jobs, onResult) {
     const cfg = getCfg();
     if (!cfg.apiKey) { UI.showStatus('brh-match', '请先在「设置」填写 API Key，或改用「本地关键词」匹配', 'err'); UI.switchTab('settings'); return; }
-    const payload = jobs.map((j, i) => ({ idx: i, title: j.title, salary: j.salary, company: j.company, area: j.area, tags: j.tags, desc: (j.desc || '').slice(0, 200) }));
+    const payload = jobs.map((j, i) => ({ idx: i, title: j.title, salary: j.salary, company: j.company, scale: j.scale, area: j.area, tags: j.tags, desc: (j.desc || '').slice(0, 200) }));
     const messages = [
       { role: 'system', content: '你是招聘匹配专家。给定候选人简历和一批岗位，逐岗评估匹配度。严格只输出一个 JSON 数组，每个元素形如 {"idx":序号,"score":0到100的整数,"fit":"合适|一般|不太合适","reason":"20字内中文理由，点出关键匹配或不匹配点"}。不要任何解释、不要 Markdown 代码块标记、不要序号。' },
       { role: 'user', content: `【候选人简历】\n${resume}\n\n【待匹配岗位】\n${JSON.stringify(payload)}` }
@@ -384,7 +385,7 @@
           <span class="brh-job-title" title="${esc(job.title)}">${esc(job.title)}</span>
           <span class="brh-badge ${cls}">${r.score}</span>
         </div>
-        <div class="brh-job-meta">${esc(job.company || '—')}${job.salary ? '　·　' + esc(job.salary) : ''}${job.area ? '　·　' + esc(job.area) : ''}</div>
+        <div class="brh-job-meta">${esc(job.company || '—')}${job.scale ? '　·　' + esc(job.scale) : ''}${job.salary ? '　·　' + esc(job.salary) : ''}${job.area ? '　·　' + esc(job.area) : ''}</div>
         ${job.tags.length ? `<div class="brh-job-meta">${job.tags.slice(0, 6).map((t) => '<span class="brh-chip">' + esc(t) + '</span>').join('')}</div>` : ''}
         <div class="brh-job-reason">${esc(r.reason)}</div>
         <div style="text-align:right;margin-top:6px"><button class="brh-btn sm" data-apply="${i}">应用此岗位 →</button></div>
@@ -737,60 +738,86 @@
     }, opts.silent ? 'brh-optimize' : 'brh-chat');
   }
 
-  /* ---- HR 智能回复：抓取 HR 最新提问 → 结合优化简历与 JD 生成针对性回复 ---- */
+  /* ---- HR 智能回复：抓取双方完整对话 → 结合知识库与优化简历生成针对性回复 ---- */
 
 
-  // 超宽泛多策略抓取聊天里对方（HR）的最新一条消息：返回 { text, debug }
-  function extractHrQuestion() {
+  // 消息噪音过滤：时间戳 / 已读回执 / 系统提示
+  function isChatNoise(t) {
+    return /^\d{1,2}:\d{2}(:\d{2})?$/.test(t) ||
+      /^(已读|已送达|未读|对方正在输入|以下为新消息|消息已撤回|系统消息)$/.test(t);
+  }
+
+  // 把对话消息渲染成带角色前缀的文本（"HR"为对方，"我"为候选人）
+  function transcriptText(msgs) {
+    return (msgs || []).map((m) => (m.mine ? '我' : 'HR') + '：' + m.text).join('\n');
+  }
+
+  // 解析手动输入：支持整段对话（逐行，"HR："/"我："开头）或单个问题；返回 { msgs, lastHr }
+  function parseManualDialogue(text) {
+    const lines = String(text || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    const msgs = [];
+    lines.forEach((l) => {
+      const hr = l.match(/^(?:HR|hr|对方)\s*[:：]\s*(.+)$/);
+      const me = l.match(/^(?:我|本人)\s*[:：]\s*(.+)$/);
+      if (hr) msgs.push({ mine: false, text: cleanText(hr[1]) });
+      else if (me) msgs.push({ mine: true, text: cleanText(me[1]) });
+      else msgs.push({ mine: false, text: l });
+    });
+    const lastHr = [...msgs].reverse().find((m) => !m.mine);
+    return { msgs, lastHr: lastHr ? lastHr.text : '' };
+  }
+
+  // 超宽泛多策略抓取聊天里双方（HR + 候选人）的完整对话：返回 { msgs, text, lastHr, debug }
+  function extractConversation() {
     const debug = [];
-
-    // 策略 1：用具体 class 选择器（Boss 各版本常见聊天 DOM）
-    const selectors = [
-      '.im-list .im-item .im-msg-left',
-      '.im-list .im-item:not(.im-msg-right) .im-msg',
-      '.im-msg-left',
-      '.msg-left',
-      '.chat-message.left .message-content',
-      '.chat-message:not(.right):not(.self) .msg-text',
-      '.message-list .left .msg-content',
-      '.message-item:not(.self):not(.mine) .message-content',
-      '.msg-item.left .msg-text',
-      '.im-item .message-content',
-      '[class*="msg-left"]',
-      '[class*="message"][class*="left"]',
-      '.chat-msg .msg-text'
-    ];
-    let msgs = [];
-    for (const sel of selectors) {
-      try {
-        const els = $$(sel);
-        if (els.length) { debug.push(sel + ' → ' + els.length + ' 个'); break; }
-      } catch (e) {}
-    }
-
-    // 策略 2：遍历所有聊天容器，按 class 区分自己/对方，收集全部消息后取最后一条
-    if (!msgs.length) {
-      const containers = [
-        '.im-list', '.message-list', '.chat-message-list', '.msg-list',
-        '.chat-content', '.im-chat', '.chat-list', '[class*="message-list"]',
-        '[class*="chat-content"]', '[class*="msg-list"]'
-      ];
-      for (const cSel of containers) {
-        const c = $(cSel);
-        if (!c) continue;
-        const items = $$('[class*="item"], [class*="message"], [class*="msg"]', c);
-        items.forEach((el) => {
-          const cls = ((el.className || '') + ' ' + ((el.parentElement && el.parentElement.className) || '')).toString();
-          const mine = SELF_MSG_RE.test(cls);
-          if (mine) return;
-          const t = cleanText(txt(el));
-          if (t && t.length >= 2 && t.length < 800) msgs.push(t);
-        });
-        if (msgs.length) { debug.push('遍历 ' + cSel + ' → 对方 ' + msgs.length + ' 条'); break; }
+    const msgs = [];
+    const seen = new Map(); // 文本 → msgs 下标（父子嵌套元素会采到同一条消息）
+    const push = (mine, el) => {
+      const t = cleanText(txt(el));
+      if (!t || t.length < 2 || t.length > 800 || isChatNoise(t)) return;
+      const idx = seen.get(t);
+      if (idx !== undefined) {
+        // 外层容器往往不带 right 类；内层气泡更可能携带，用于修正消息归属
+        if (mine) msgs[idx].mine = true;
+        return;
       }
+      seen.set(t, msgs.length);
+      msgs.push({ mine: !!mine, text: t });
+    };
+
+    // 策略 1：定位聊天消息容器，逐条按 class 区分自己/对方，保持 DOM 顺序（即时间顺序）
+    const containers = [
+      '.im-list', '.message-list', '.chat-message-list', '.msg-list',
+      '.chat-content', '.im-chat', '.chat-list', '[class*="message-list"]',
+      '[class*="chat-content"]', '[class*="msg-list"]', '[class*="messageList"]'
+    ];
+    for (const cSel of containers) {
+      const c = $(cSel);
+      if (!c) continue;
+      const items = $$('[class*="item"], [class*="message"], [class*="msg"], [class*="bubble"]', c);
+      if (!items.length) continue;
+      items.forEach((el) => {
+        // 沿父级向上找 4 层：自己消息的容器通常带 right/self/mine 类
+        let mine = false;
+        let p = el;
+        for (let d = 0; p && d < 4; d++, p = p.parentElement) {
+          if (SELF_MSG_RE.test(String(p.className || ''))) { mine = true; break; }
+        }
+        push(mine, el);
+      });
+      if (msgs.length) { debug.push(cSel + ' → ' + msgs.length + ' 条'); break; }
     }
 
-    // 策略 3：终极兜底 —— 取页面上所有可见文本块中属于聊天区域的
+    // 策略 2：无容器命中时，直接抓左右消息元素（left=对方，right=自己）
+    if (!msgs.length) {
+      $$('[class*="msg-left"], [class*="msg-right"], [class*="message-left"], [class*="message-right"]').forEach((el) => {
+        const cls = ((el.className || '') + ' ' + ((el.parentElement && el.parentElement.className) || '')).toString();
+        push(SELF_MSG_RE.test(cls), el);
+      });
+      if (msgs.length) debug.push('左右消息元素 → ' + msgs.length + ' 条');
+    }
+
+    // 策略 3：终极兜底 —— 取页面上所有可见文本块，无法区分双方，全部按对方处理
     if (!msgs.length) {
       const all = document.querySelectorAll('div, span, p');
       for (const el of all) {
@@ -802,7 +829,7 @@
             // 只在 chat 地理区域内
             const rect = el.getBoundingClientRect();
             if (rect.width > 100 && rect.height > 10 && rect.top > 100 && rect.top < window.innerHeight - 50) {
-              msgs.push(t);
+              push(false, el);
             }
           }
         }
@@ -810,9 +837,68 @@
       if (msgs.length) debug.push('全文兜底 → ' + msgs.length + ' 条');
     }
 
-    // 取最后一条（最新的），而不是「最像提问的」
-    const best = msgs.length ? msgs[msgs.length - 1] : '';
-    return { text: best, debug: debug.join(' | ') };
+    // 相邻去重：嵌套采集时父块文本可能包含子块文本，保留信息更全的那条（仅同侧合并，避免吞掉对方消息）
+    const clean = [];
+    for (const m of msgs) {
+      const prev = clean[clean.length - 1];
+      if (!prev || prev.mine !== m.mine) { clean.push(m); continue; }
+      if (prev.text.includes(m.text)) continue;
+      if (m.text.includes(prev.text)) { clean[clean.length - 1] = m; continue; }
+      clean.push(m);
+    }
+
+    // 只保留最近 16 条，控制 prompt 长度
+    const recent = clean.slice(-16);
+    const lastHrMsg = [...recent].reverse().find((m) => !m.mine);
+    return {
+      msgs: recent,
+      text: transcriptText(recent),
+      lastHr: lastHrMsg ? lastHrMsg.text : '',
+      debug: debug.join(' | ')
+    };
+  }
+
+  /* 岗位领域识别：国内电商 / 跨境电商 / 其他 —— 让智能回复贴合岗位赛道、不串领域 */
+  const DOMESTIC_ECOM_RE = '淘宝|天猫|京东|拼多多|抖音|抖店|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|淘特|京喜|兴趣电商|货架电商|直播电商|千川|直通车|引力魔方|生意参谋|国内(电商|市场|业务|平台|仓)';
+  const CROSSBORDER_ECOM_RE = '跨境|出海|亚马逊|amazon|shopee|lazada|速卖通|aliexpress|tiktok|temu|shein|wish|ebay|etsy|wayfair|coupang|ozon|mercado|独立站|海外(仓|市场|业务|电商|站)|外贸|出口|国际站|关务|清关|fba|头程|海外本土';
+
+  function countDomainHits(text) {
+    const t = String(text || '');
+    return {
+      domestic: (t.match(new RegExp(DOMESTIC_ECOM_RE, 'gi')) || []).length,
+      cross: (t.match(new RegExp(CROSSBORDER_ECOM_RE, 'gi')) || []).length
+    };
+  }
+
+  // 依据 JD / 岗位需求理解判定岗位领域；判定不出时用 HR 对话里提到的业务补充
+  function detectJobDomain(extraText) {
+    const jd = getStore(STORE_KEYS.jd, '');
+    const jdExplain = getStore(STORE_KEYS.jdExplain, '');
+    const hit = countDomainHits(cleanText(jd).slice(0, 4000) + '\n' + cleanText(jdExplain).slice(0, 1200));
+    if (!(hit.domestic >= 2 && hit.domestic > hit.cross) && !(hit.cross >= 2 && hit.cross > hit.domestic)) {
+      const c = countDomainHits(cleanText(extraText || '').slice(0, 1500));
+      hit.domestic += c.domestic;
+      hit.cross += c.cross;
+    }
+    if (hit.domestic >= 2 && hit.domestic > hit.cross) return 'domestic';
+    if (hit.cross >= 2 && hit.cross > hit.domestic) return 'cross';
+    return 'unknown';
+  }
+
+  /* 真实经历锚点：从简历里提取候选人真实做过的平台/业务词，作为回复的硬边界（防止 AI 编造 Ozon/亚马逊等简历里没有的经历） */
+  const RESUME_PLATFORM_RE = /淘宝|天猫|京东|拼多多|抖音|抖店|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|当当|聚美优品|网易严选|小米有品|有赞|微店|直通车|引力魔方|生意参谋|千川|万相台|超级推荐|钻展|聚划算|淘抢购|天天特价|淘金币|亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|TikTok|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|Shopify|店匠|Shoplazza|WooCommerce|美团|饿了么|携程|飞猪|同程|马蜂窝|滴滴|货拉拉|贝壳|链家|安居客|钉钉|企业微信|飞书|微信|小程序|公众号|视频号|直播|私域|社群|GMV|ROI|ROAS|listing|FBA|海外仓|头程|清关|关务|VAT|跨境支付|PayPal|PingPong|连连支付|万里汇|WorldFirst|Payoneer|Stripe|英语|日语|韩语|俄语|西班牙语|德语|法语|阿拉伯语|小语种|本地化|多语种|海外|外贸|出口|国际站|跨境|出海/gi;
+
+  function extractResumeAnchors() {
+    const resume = getStore(STORE_KEYS.optimized, '') || getStore(STORE_KEYS.resume, '');
+    const hits = [];
+    const re = new RegExp(RESUME_PLATFORM_RE.source, 'gi');
+    let m;
+    while ((m = re.exec(resume)) !== null) {
+      const w = m[0];
+      if (!hits.some((h) => h.toLowerCase() === w.toLowerCase())) hits.push(w);
+      if (hits.length >= 30) break;
+    }
+    return hits;
   }
 
   /* ============================================================
@@ -838,7 +924,8 @@
       }
       const chunk = clean.slice(i, end).trim();
       if (chunk) chunks.push(chunk);
-      i = end - overlap;
+      if (end >= clean.length) break;
+      i = Math.max(end - overlap, i + 1);
     }
     return chunks;
   }
@@ -882,11 +969,40 @@
     return set;
   }
 
-  // RAG 主函数：从所有知识源检索与 HR 问题最相关的 Top-K 片段
-  function ragRetrieve(hrQuestion, topK) {
+  // RAG 结果缓存（避免相同 query + 知识库重复计算）
+  const RAG_CACHE = new Map();
+  const RAG_CACHE_MAX = 10;
+
+  function ragCacheGet(key) {
+    const v = RAG_CACHE.get(key);
+    if (v) { RAG_CACHE.delete(key); RAG_CACHE.set(key, v); } // LRU：移到末尾
+    return v;
+  }
+  function ragCacheSet(key, val) {
+    if (RAG_CACHE.size >= RAG_CACHE_MAX) {
+      const firstKey = RAG_CACHE.keys().next().value;
+      RAG_CACHE.delete(firstKey);
+    }
+    RAG_CACHE.set(key, val);
+  }
+
+  // RAG 主函数：从所有知识源检索与 HR 问题最相关的 Top-K 片段（skipPrevRound：页面已抓到完整对话时跳过旧存储的一轮问答，避免重复）
+  function ragRetrieve(hrQuestion, topK, skipPrevRound) {
     topK = topK || 5;
     const query = cleanText(hrQuestion || '');
     if (!query) return { context: '', sources: [] };
+
+    // 缓存 key：query + 知识库长度 + skipPrevRound（避免相同输入重复计算）
+    const cacheKey = [query,
+      getStore(STORE_KEYS.jd, '').length,
+      getStore(STORE_KEYS.resume, '').length,
+      getStore(STORE_KEYS.optimized, '').length,
+      getStore(STORE_KEYS.jdExplain, '').length,
+      getStore(STORE_KEYS.jdFit, '').length,
+      skipPrevRound
+    ].join('|');
+    const cached = ragCacheGet(cacheKey);
+    if (cached) return cached;
 
     // 收集所有知识源
     const sources = [];
@@ -903,7 +1019,7 @@
     else if (resume) sources.push({ name: '原始简历', text: resume, weight: 1.5 });
     if (jdExplain) sources.push({ name: '岗位需求理解', text: jdExplain, weight: 1.3 });
     if (jdFit) sources.push({ name: '岗位适配度分析', text: jdFit, weight: 1.2 });
-    if (prevQ && prevA) sources.push({ name: '上一轮 HR 对话', text: 'HR问：' + prevQ + '\n候选人答：' + prevA, weight: 1.0 });
+    if (prevQ && prevA && !skipPrevRound) sources.push({ name: '上一轮 HR 对话', text: 'HR问：' + prevQ + '\n候选人答：' + prevA, weight: 1.0 });
 
     if (!sources.length) return { context: '', sources: [] };
 
@@ -930,52 +1046,82 @@
       if (!usedSources.includes(c.source)) usedSources.push(c.source);
     });
 
-    return { context: context.trim(), sources: usedSources, chunks: top };
+    const result = { context: context.trim(), sources: usedSources, chunks: top };
+    ragCacheSet(cacheKey, result);
+    return result;
   }
 
   function generateHrReply(opts = {}) {
     const optimized = getStore(STORE_KEYS.optimized, '');
     if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
     const jd = getStore(STORE_KEYS.jd, '');
-    const manual = opts.manual || '';
-    const picked = extractHrQuestion();
-    let question = manual || picked.text;
+    const manual = String(opts.manual || '').trim();
+
+    // 抓取双方完整对话；手动输入时把输入内容解析成对话（支持整段对话或单个问题）
+    let conv, question;
+    if (manual) {
+      conv = parseManualDialogue(manual);
+    } else {
+      conv = extractConversation();
+    }
+    question = conv.lastHr;
+
     // 反馈抓到了什么（方便用户确认 / 排查）
-    if (!manual && picked.debug && question) {
-      toast('🎯 已识别 HR 最新消息（' + ((picked.debug.split('→').pop() || '').trim() || '匹配') + '）', 'ok');
+    if (!manual && conv.msgs.length && question) {
+      toast('🎯 已读取对话 ' + conv.msgs.length + ' 条（' + ((conv.debug.split('→').pop() || '').trim() || '匹配') + '）', 'ok');
     }
     if (!question) {
       // 页面上抓不到 → 让用户手动粘贴 HR 的问题
-      const v = prompt('未在当前页面识别到 HR 的消息。\n\n调试信息：' + (picked.debug || '无匹配选择器') + '\n\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
+      const v = prompt('未在当前页面识别到 HR 的消息。\n\n调试信息：' + (conv.debug || '无匹配选择器') + '\n\n请把 HR 的问题复制粘贴到这里（留空取消）：', getStore(STORE_KEYS.hrQuestion, ''));
       if (!v || !v.trim()) return;
-      question = v.trim();
+      conv = parseManualDialogue(v.trim());
+      question = conv.lastHr;
     }
-    setStore(STORE_KEYS.hrQuestion, question);
-    if (!opts.silent) UI.showStatus('brh-chat', '正在 RAG 检索相关知识…');
+    setStore(STORE_KEYS.hrQuestion, transcriptText(conv.msgs) || question);
+    if (!opts.silent) UI.showStatus('brh-chat', '正在结合对话上下文检索知识库…');
 
-    // === RAG 增强：从 JD/简历/岗位理解/适配度 检索与 HR 问题最相关的片段 ===
-    const rag = ragRetrieve(question, 5);
+    // === RAG 增强：用 HR 最近几条消息做查询，从 JD/简历/岗位理解/适配度 检索最相关的片段 ===
+    const hrRecent = conv.msgs.filter((m) => !m.mine).slice(-3).map((m) => m.text).join(' ');
+    const rag = ragRetrieve(hrRecent || question, 5, conv.msgs.length >= 2);
 
-    // 构建带 RAG 上下文的 system prompt
+    // 岗位领域约束：国内电商岗位严禁说成跨境方向，跨境岗位才说跨境，防止串领域
+    const domain = detectJobDomain(conv.msgs.filter((m) => !m.mine).map((m) => m.text).join('\n'));
+    const anchors = extractResumeAnchors();
+    const hasDomesticAnchor = anchors.some((a) => /淘宝|天猫|京东|拼多多|抖音|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|直播|私域|社群|小程序|公众号|视频号|微信|钉钉|企业微信|飞书|美团|饿了么|携程|飞猪|同程|马蜂窝|滴滴|货拉拉|贝壳|链家|安居客/i.test(a));
+    const hasCrossAnchor = anchors.some((a) => /亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|TikTok|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|Shopify|店匠|Shoplazza|WooCommerce|海外仓|头程|清关|关务|VAT|跨境支付|PayPal|PingPong|连连支付|万里汇|WorldFirst|Payoneer|Stripe|英语|日语|韩语|俄语|西班牙语|德语|法语|阿拉伯语|小语种|本地化|多语种|海外|外贸|出口|国际站|跨境|出海|listing|FBA/i.test(a));
+    const domainRule = domain === 'domestic'
+      ? '岗位领域约束：该岗位是国内电商。回复必须完全立足国内电商语境（淘宝/天猫/京东/拼多多/抖音电商等国内平台与打法）；严禁出现亚马逊、Shopee、TikTok Shop、速卖通、独立站、出海、外贸等跨境表述；候选人若只有跨境经历，只能提炼为选品、投放、转化率、ROI、直播、活动策划等平台无关的通用运营能力，严禁声称有国内平台实操经验。'
+      + (hasDomesticAnchor ? '' : '【特别注意】候选人简历中没有任何国内平台经历，不得编造国内平台经验，只能如实说明并强调通用运营能力的可迁移性。')
+      : domain === 'cross'
+        ? '岗位领域约束：该岗位是跨境电商。回复必须完全立足跨境电商语境（平台运营、海外市场、listing、广告投放、物流与本地化等），优先使用候选人的跨境相关经历；国内电商经历只能提炼为通用运营能力，严禁声称有跨境平台实操经验。'
+        + (hasCrossAnchor ? '' : '【特别注意】候选人简历中没有任何跨境经历，不得编造跨境平台经验，必须如实说明候选人目前以国内经验为主，用通用运营能力作答。')
+        : '岗位领域约束：回复的业务领域必须与 JD 和对话中体现的岗位领域一致，不得把候选人经历包装成岗位之外的电商领域（如国内电商岗位不得说跨境电商经验，跨境电商岗位不得说国内电商经验）。';
+
+    // 构建带对话上下文与 RAG 知识的 system prompt
     const sys = [
-      '你是一位帮助求职者与 HR 沟通的顾问。根据 HR 的最新提问，结合下面【检索到的相关知识】，用候选人的第一人称写一条 Boss 直聘回复。',
+      '你是一位帮助求职者与 HR 沟通的顾问。先阅读【最近对话记录】理解双方已沟通的内容与 HR 的关注点（HR 问过什么、候选人已答过什么），再针对 HR 的最新提问，结合【检索到的相关知识】，用候选人的第一人称写一条 Boss 直聘回复。',
       '严格遵守：',
-      '1. 只使用【检索到的相关知识】里真实存在的经历与数据，严禁编造；',
-      '2. 优先依据「岗位适配度分析」和「岗位需求理解」来回答，体现你对该岗位的深入理解；',
-      '3. 结合「优化后简历」中与 HR 问题最相关的具体经历/数据来佐证，不要泛泛自我介绍；',
-      '4. 如果 HR 问了岗位相关但简历未覆盖的信息（如到岗时间、期望薪资），结合 JD 要求给出得体答法并提醒用户按实际情况确认；',
-      '5. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
-      '6. 只输出回复正文，不要引号、前缀和解释。'
+      '1. ' + domainRule,
+      '2. 真实经历边界：回复中声称拥有的平台、公司、项目、经历，必须能在【候选人真实经历关键词】或【检索到的相关知识】中找到出处；严禁把没有的经历写成自己的（如关键词里没有 Ozon/亚马逊 就不得声称做过）；可以如实说明没有某平台经验，并用最接近的真实经历迁移；',
+      '3. 只使用【检索到的相关知识】里真实存在的经历与数据，严禁编造；',
+      '4. 承接对话上下文：如果是追问，先呼应此前问答，不要重复已说过的内容，更不要答非所问；',
+      '5. 优先依据「岗位适配度分析」和「岗位需求理解」来回答，体现你对该岗位的深入理解；',
+      '6. 结合「优化后简历」中与 HR 问题最相关的具体经历/数据来佐证，不要泛泛自我介绍；',
+      '7. 经验空白如实填补：HR 问到简历未覆盖的经历时，不得编造；应如实说明（如「这块我接触不多」），再用最接近的真实经历或可迁移能力作答，或结合 JD 表达学习意愿；',
+      '8. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '9. 只输出回复正文，不要引号、前缀和解释。'
     ].join('\n');
 
-    // 构建 user prompt：RAG 检索结果 + HR 问题
+    // 构建 user prompt：对话记录 + RAG 检索结果 + 真实经历锚点 + HR 最新提问
     let userContent = '';
+    if (conv.msgs.length) {
+      userContent += '【最近对话记录（"HR"为对方，"我"为候选人，按时间先后）】\n' + transcriptText(conv.msgs) + '\n\n';
+    }
     if (rag.context) {
       userContent += '【检索到的相关知识（RAG）】\n' + rag.context + '\n\n';
-    } else {
-      // RAG 无结果时兜底：使用完整文档
-      userContent += '【目标岗位 JD】\n' + jd.slice(0, 2000) + '\n\n';
-      userContent += '【优化后简历】\n' + optimized.slice(0, 6000) + '\n\n';
+    }
+    if (anchors.length) {
+      userContent += '【候选人真实经历关键词（只能使用这些，不得出现其他平台/经历）】\n' + anchors.join('、') + '\n\n';
     }
     userContent += '【HR 的最新提问】\n' + question;
 
@@ -991,6 +1137,63 @@
       UI.showStatus('brh-chat', '✅ 回复已生成' + srcInfo + '，检查后可填入聊天框', 'ok');
       if (!opts.silent) toast('针对 HR 提问的回复已生成' + srcInfo, 'ok');
     }, 'brh-chat');
+  }
+
+  /* 润色用户自己写的话术：保留原意，结合对话 + 知识库 + 简历真实经历优化表达 */
+  function polishUserMessage() {
+    const draft = String($('#brh-polish-in') ? $('#brh-polish-in').value : '').trim();
+    if (!draft) { toast('请先输入或粘贴你要润色的话术', 'err'); return; }
+    const optimized = getStore(STORE_KEYS.optimized, '');
+    if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
+    const jd = getStore(STORE_KEYS.jd, '');
+    const conv = extractConversation();
+    const hrRecent = conv.msgs.filter((m) => !m.mine).slice(-3).map((m) => m.text).join(' ');
+    const rag = ragRetrieve(draft + ' ' + hrRecent, 5, conv.msgs.length >= 2);
+    const anchors = extractResumeAnchors();
+    const domain = detectJobDomain(conv.msgs.filter((m) => !m.mine).map((m) => m.text).join('\n'));
+    const domainRule = domain === 'domestic'
+      ? '岗位领域约束：该岗位是国内电商，润色后不得引入跨境平台/出海/外贸等表述。'
+      : domain === 'cross'
+        ? '岗位领域约束：该岗位是跨境电商，润色后不得引入国内电商平台的表述。'
+        : '';
+
+    const sys = [
+      '你是一位求职沟通润色助手。用户已写好一条要发给 HR 的回复草稿，请结合【最近对话记录】和【检索到的相关知识】，把草稿润色成更专业、得体、有说服力的 Boss 直聘回复。',
+      '严格遵守：',
+      '1. 保留用户的原意、核心信息与语气，不得改变用户想表达的内容；',
+      '2. 只允许使用【检索到的相关知识】和【候选人真实经历关键词】里真实存在的经历与数据来补充细节，严禁编造用户没写过的经历、平台、公司、数据；',
+      '3. 不得出现【候选人真实经历关键词】之外的平台或经历；',
+      (domainRule ? '4. ' + domainRule : '4. 润色后不得改变草稿的业务领域表述；'),
+      '5. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '6. 只输出润色后的正文，不要引号、前缀和解释。'
+    ].join('\n');
+
+    let userContent = '';
+    if (conv.msgs.length) {
+      userContent += '【最近对话记录（"HR"为对方，"我"为候选人，按时间先后）】\n' + transcriptText(conv.msgs) + '\n\n';
+    }
+    if (rag.context) {
+      userContent += '【检索到的相关知识（RAG）】\n' + rag.context + '\n\n';
+    } else {
+      userContent += '【目标岗位 JD】\n' + jd.slice(0, 2000) + '\n\n';
+      userContent += '【优化后简历】\n' + optimized.slice(0, 6000) + '\n\n';
+    }
+    if (anchors.length) {
+      userContent += '【候选人真实经历关键词（只能使用这些，不得出现其他平台/经历）】\n' + anchors.join('、') + '\n\n';
+    }
+    userContent += '【HR 的最新提问】\n' + (hrRecent || '（无）') + '\n\n【用户草稿】\n' + draft;
+
+    const messages = [
+      { role: 'system', content: sys },
+      { role: 'user', content: userContent }
+    ];
+    UI.showStatus('brh-polish', '正在润色，请稍候…');
+    callLLM(messages, (content) => {
+      const out = $('#brh-polish-out');
+      if (out) out.value = content;
+      UI.showStatus('brh-polish', '✅ 润色完成，可继续编辑后填入聊天框', 'ok');
+      toast('润色完成', 'ok');
+    }, 'brh-polish');
   }
 
   /* ============================================================
@@ -1826,6 +2029,7 @@
         <div class="brh-row" style="margin-top:10px">
           <button class="brh-btn ghost sm" id="brh-explain">📖 岗位需求理解</button>
           <button class="brh-btn ghost sm" id="brh-fit" ${meta.title ? '' : 'disabled title="请先抓取/粘贴 JD"'}>📊 岗位适配度</button>
+          <button class="brh-btn" id="brh-analyze-all" ${meta.title ? '' : 'disabled title="请先抓取/粘贴 JD"'}>⚡ 一键分析</button>
           <button class="brh-btn ghost sm" id="brh-xhs" ${meta.title ? '' : 'disabled title="请先抓取/粘贴 JD 获取岗位名称"'}>📕 小红书搜经验</button>
         </div>
         <div class="brh-status" id="brh-explain-status"></div>
@@ -1848,6 +2052,20 @@
       $('#brh-jd-area').addEventListener('change', (e) => { setStore(STORE_KEYS.jd, e.target.value); this.showStatus('brh-jd', '已保存手动编辑', 'ok'); });
       const explainBtn = $('#brh-explain'); if (explainBtn) explainBtn.onclick = () => explainPosition();
       const fitBtn = $('#brh-fit'); if (fitBtn) fitBtn.onclick = () => analyzeFit();
+      const analyzeAllBtn = $('#brh-analyze-all'); if (analyzeAllBtn) analyzeAllBtn.onclick = () => {
+        UI.showStatus('brh-jd', '⚡ 正在并行分析岗位需求与适配度…');
+        // 并行调用两个 LLM，互不依赖
+        let done = 0;
+        const checkDone = () => { if (++done === 2) UI.showStatus('brh-jd', '✅ 岗位需求解读 + 适配度分析完成', 'ok'); };
+        explainPosition();
+        analyzeFit();
+        // explainPosition 和 analyzeFit 内部各自有状态更新，这里用轮询检测完成
+        const timer = setInterval(() => {
+          const explainDone = getStore(STORE_KEYS.jdExplain, '');
+          const fitDone = getStore(STORE_KEYS.jdFit, '');
+          if (explainDone && fitDone) { clearInterval(timer); checkDone(); }
+        }, 500);
+      };
       const xhsBtn = $('#brh-xhs'); if (xhsBtn) xhsBtn.onclick = () => searchXhs(meta.title || '');
       const explainCopy = $('#brh-explain-copy'); if (explainCopy) explainCopy.onclick = () => {
         const v = getStore(STORE_KEYS.jdExplain, '');
@@ -2056,8 +2274,8 @@
         <div class="brh-tip">先生成打招呼话术；然后可一键填入 Boss 聊天框，并把优化后的简历以图片形式发给当前 HR。</div>`}
 
         <div class="brh-row" style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
-          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">按 HR 最新提问 + 优化简历生成</span></div>
-          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取 HR 最新消息；抓不到时手动把 HR 的问题粘贴到这里">${esc(hrQ)}</textarea>
+          <div class="brh-label">🎯 HR 智能回复<span class="brh-chip">对话理解 · 领域识别 · 知识库 · 简历</span></div>
+          <textarea class="brh-area" id="brh-hr-q" style="min-height:56px" placeholder="自动抓取双方对话与 HR 最新消息；抓不到时可手动粘贴对话（每行一条，HR：/我：开头）或只贴 HR 的问题">${esc(hrQ)}</textarea>
           <div class="brh-row" style="margin-top:6px">
             <button class="brh-btn ghost sm" id="brh-hr-grab">🎯 抓取 HR 提问</button>
             <button class="brh-btn" id="brh-hr-gen" ${optimized ? '' : 'disabled title="请先在「优化」页生成优化简历"'}>💬 生成针对性回复</button>
@@ -2070,7 +2288,22 @@
             <button class="brh-btn green sm" id="brh-hr-copy">📋 复制回复</button>
             <button class="brh-btn sm" id="brh-hr-fill">📝 填入聊天框</button>
           </div>` : ''}
-          <div class="brh-tip">在 HR 聊天页点「生成针对性回复」，脚本会读取 HR 最新提问，结合优化后的简历与岗位 JD 生成第一人称回复；生成后请核对数字与事实再发送。</div>
+          <div class="brh-tip">在 HR 聊天页点「生成针对性回复」，脚本会读取双方完整对话理解上下文，自动识别岗位属于国内电商还是跨境电商，再结合知识库与优化后的简历生成<b>贴合岗位领域、不串赛道</b>的第一人称回复（国内岗位只说国内电商，跨境岗位才说跨境）；生成后请核对数字与事实再发送。</div>
+        </div>
+
+        <div class="brh-row" style="margin-top:14px;border-top:1px dashed #e5e7eb;padding-top:10px">
+          <div class="brh-label">✍️ 润色我的回复<span class="brh-chip">保留你的原意 · 结合简历与知识库</span></div>
+          <textarea class="brh-area" id="brh-polish-in" style="min-height:56px" placeholder="自己写好的回复粘贴到这里，AI 帮你润色得更专业（不改变你的原意）"></textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn" id="brh-polish-btn">✨ 润色</button>
+          </div>
+          <div class="brh-status" id="brh-polish-status"></div>
+          <textarea class="brh-area" id="brh-polish-out" style="min-height:110px;margin-top:8px" placeholder="润色结果会显示在这里，可继续编辑"></textarea>
+          <div class="brh-row" style="margin-top:6px">
+            <button class="brh-btn green sm" id="brh-polish-copy">📋 复制</button>
+            <button class="brh-btn sm" id="brh-polish-fill">📝 填入聊天框</button>
+          </div>
+          <div class="brh-tip">润色只优化表达、补充真实细节，不改变你的原意、不添加你没写过的经历；润色后请核对再发送。</div>
         </div>`;
       const gen = $('#brh-gen-greeting'); if (gen) gen.onclick = generateGreeting;
       const area = $('#brh-greet-area');
@@ -2082,15 +2315,16 @@
         generateHrReply({ manual: $('#brh-hr-q').value.trim() || undefined });
       };
       const hrGrab = $('#brh-hr-grab'); if (hrGrab) hrGrab.onclick = () => {
-        const r = extractHrQuestion();
+        const r = extractConversation();
         const st = $('#brh-hr-status');
-        if (r.text) {
+        if (r.lastHr) {
           $('#brh-hr-q').value = r.text;
           setStore(STORE_KEYS.hrQuestion, r.text);
-          if (st) { st.textContent = '✅ 已识别 HR 最新消息（' + (r.debug || '匹配') + '）'; st.className = 'brh-status ok'; }
-          toast('🎯 已抓取 HR 最新消息', 'ok');
+          const hrN = r.msgs.filter((m) => !m.mine).length;
+          if (st) { st.textContent = '✅ 已抓取对话 ' + r.msgs.length + ' 条（HR ' + hrN + ' 条），最新提问：' + r.lastHr.slice(0, 30); st.className = 'brh-status ok'; }
+          toast('🎯 已抓取双方对话 ' + r.msgs.length + ' 条', 'ok');
         } else {
-          if (st) { st.textContent = '❌ 未识别到 HR 消息（' + (r.debug || '无匹配选择器') + '），请手动粘贴'; st.className = 'brh-status err'; }
+          if (st) { st.textContent = '❌ 未识别到对话（' + (r.debug || '无匹配选择器') + '），请手动粘贴'; st.className = 'brh-status err'; }
           toast('未识别到 HR 消息，请手动粘贴', 'err');
         }
       };
@@ -2106,6 +2340,17 @@
       };
       const hrQArea = $('#brh-hr-q');
       if (hrQArea) hrQArea.addEventListener('change', (e) => setStore(STORE_KEYS.hrQuestion, e.target.value.trim()));
+      const polishBtn = $('#brh-polish-btn'); if (polishBtn) polishBtn.onclick = polishUserMessage;
+      const polishCopy = $('#brh-polish-copy'); if (polishCopy) polishCopy.onclick = () => {
+        const v = $('#brh-polish-out').value.trim();
+        if (!v) { toast('暂无润色结果', 'err'); return; }
+        navigator.clipboard.writeText(v).then(() => toast('已复制', 'ok'), () => toast('复制失败，请手动选择', 'err'));
+      };
+      const polishFill = $('#brh-polish-fill'); if (polishFill) polishFill.onclick = () => {
+        const v = $('#brh-polish-out').value.trim();
+        if (!v) { toast('暂无润色结果', 'err'); return; }
+        fillGreeting(v);
+      };
     },
 
     /* HR 智能回复生成完毕后刷新聊天页（问题与回复已入存储） */
@@ -2162,6 +2407,7 @@
         <div class="brh-row">
           <span class="brh-chip">版本 v${VERSION}</span>
           <button class="brh-btn ghost sm" id="brh-check-update">🔄 检查更新</button>
+          <button class="brh-btn" id="brh-update-now" style="display:none">⬆️ 在线更新</button>
         </div>
         <div class="brh-status" id="brh-update-status"></div>
         <div class="brh-row">
@@ -2329,8 +2575,13 @@
         if (!m) { if (!silent) UI.showStatus('brh-update', '未获取到版本信息（更新地址可能未配置）', 'err'); return; }
         const latest = m[1];
         if (compareVersion(latest, VERSION) > 0) {
-          UI.showStatus('brh-update', `🆕 发现新版本 v${latest}（当前 v${VERSION}）。请到「${getUpdateUrl()}」重新导入，或等待油猴自动更新。`, 'ok');
-          toast('发现新版本 v' + latest, 'info');
+          UI.showStatus('brh-update', `🆕 发现新版本 v${latest}（当前 v${VERSION}）`, 'ok');
+          const updateBtn = $('#brh-update-now');
+          if (updateBtn) {
+            updateBtn.style.display = '';
+            updateBtn.onclick = () => downloadAndUpdate(latest);
+          }
+          if (!silent) toast('发现新版本 v' + latest + '，点击「在线更新」升级', 'info');
         } else if (!silent) {
           UI.showStatus('brh-update', `✅ 已是最新（v${VERSION}）`, 'ok');
         }
@@ -2338,6 +2589,132 @@
       onerror() { if (!silent) UI.showStatus('brh-update', '检查更新失败（网络受限或地址未配置）', 'err'); },
       ontimeout() { if (!silent) UI.showStatus('brh-update', '检查更新超时', 'err'); }
     });
+  }
+
+  /* 在线更新：下载最新脚本 → 打开更新引导页（复制内容 + 油猴操作指引） */
+  function downloadAndUpdate(version) {
+    UI.showStatus('brh-update', '正在下载最新版本…');
+    GM_xmlhttpRequest({
+      method: 'GET', url: getUpdateUrl(), timeout: 30000,
+      onload(res) {
+        const content = res.responseText || '';
+        if (!content || content.length < 1000) {
+          UI.showStatus('brh-update', '下载失败：内容异常', 'err');
+          return;
+        }
+        setStore('brh_update_content', content);
+        setStore('brh_update_version', version);
+        openUpdatePage(content, version);
+        UI.showStatus('brh-update', '✅ 已下载最新版本，请按页面指引在油猴中更新', 'ok');
+      },
+      onerror() { UI.showStatus('brh-update', '下载失败', 'err'); },
+      ontimeout() { UI.showStatus('brh-update', '下载超时', 'err'); }
+    });
+  }
+
+  /* 打开更新引导页：显示脚本内容 + 复制按钮 + 油猴操作指引 */
+  function openUpdatePage(content, version) {
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Boss招聘小助手 v${version} 更新</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
+  .card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  h1 { color: #1a1a1a; font-size: 24px; margin: 0 0 16px; }
+  .step { display: flex; align-items: flex-start; margin: 12px 0; padding: 12px; background: #f8f9fa; border-radius: 8px; }
+  .step-num { width: 28px; height: 28px; background: #0ea5e9; color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 12px; flex-shrink: 0; }
+  .step-content { flex: 1; }
+  .step-title { font-weight: 600; margin-bottom: 4px; }
+  .step-desc { color: #666; font-size: 14px; line-height: 1.6; }
+  .btn { display: inline-block; padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 600; margin: 8px 8px 0 0; }
+  .btn-primary { background: #0ea5e9; color: white; }
+  .btn-secondary { background: #e5e7eb; color: #374151; }
+  .btn:hover { opacity: 0.9; }
+  .code-preview { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 12px; max-height: 200px; overflow: auto; margin-top: 12px; white-space: pre-wrap; word-break: break-all; }
+  .success { color: #10b981; font-weight: 600; }
+  .version-info { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+  .version-info strong { color: #1e40af; }
+</style>
+</head><body>
+<div class="card">
+  <h1>🆕 Boss招聘小助手 v${version} 更新</h1>
+  <div class="version-info">
+    当前版本：<strong>v${VERSION}</strong> → 新版本：<strong>v${version}</strong>
+  </div>
+  
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-content">
+      <div class="step-title">复制最新脚本内容</div>
+      <div class="step-desc">点击下方按钮复制完整脚本内容到剪贴板</div>
+      <button class="btn btn-primary" onclick="copyScript()">📋 复制脚本内容</button>
+      <span id="copy-status"></span>
+    </div>
+  </div>
+  
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-content">
+      <div class="step-title">打开油猴管理面板</div>
+      <div class="step-desc">点击下方按钮打开浏览器扩展管理页面，找到油猴（Tampermonkey）</div>
+      <button class="btn btn-secondary" onclick="openExtensions()">🔧 打开扩展管理页面</button>
+    </div>
+  </div>
+  
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-content">
+      <div class="step-title">在油猴中更新脚本</div>
+      <div class="step-desc">
+        在油猴管理面板中找到「Boss招聘小助手」，点击「编辑」，<br>
+        全选（Ctrl+A）→ 粘贴（Ctrl+V）→ 保存（Ctrl+S）
+      </div>
+    </div>
+  </div>
+  
+  <div class="step">
+    <div class="step-num">4</div>
+    <div class="step-content">
+      <div class="step-title">完成更新</div>
+      <div class="step-desc">刷新 Boss 直聘页面即可使用新版本</div>
+    </div>
+  </div>
+  
+  <div class="code-preview" id="script-preview">${content.slice(0, 300).replace(/</g, '&lt;')}...</div>
+</div>
+
+<script>
+  const scriptContent = ${JSON.stringify(content)};
+  
+  function copyScript() {
+    navigator.clipboard.writeText(scriptContent).then(() => {
+      document.getElementById('copy-status').innerHTML = '<span class="success">✅ 已复制到剪贴板</span>';
+    }).catch(() => {
+      const textarea = document.createElement('textarea');
+      textarea.value = scriptContent;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      document.getElementById('copy-status').innerHTML = '<span class="success">✅ 已复制到剪贴板</span>';
+    });
+  }
+  
+  function openExtensions() {
+    // 尝试打开浏览器扩展管理页面
+    if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.openOptionsPage) {
+      // Firefox
+      window.open('about:addons', '_blank');
+    } else {
+      // Chrome / Edge
+      window.open('chrome://extensions', '_blank');
+    }
+  }
+<\/script>
+</body></html>`;
+    
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    GM_openInTab(url, { active: true });
   }
 
   function verifyLicense(code) {
