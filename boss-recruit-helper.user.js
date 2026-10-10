@@ -1448,14 +1448,12 @@
   const CHIP_TITLE_RE = /(技能|专长|能力|证书|标签|工具|语言|Skills?)/i;
 
   // 生成简历 HTML（A4 宽度 794px ≈ 210mm @96dpi；打印时用 CSS 换算成 mm）
-  // opts.watermark：溯源水印文本（售卖版激活后自动带授权标识，防止截图/转卖后无法追责）
   function buildResumeHTML(md, theme, opts) {
     const d = parseResumeMarkdown(md);
     const meta = getStore(STORE_KEYS.jdMeta, {});
     const th = RESUME_THEMES[theme] ? RESUME_THEMES[theme] : RESUME_THEMES.modern;
     const accent = th.accent;
     const soft = th.soft || '#eef6fc';
-    const wm = (opts && opts.watermark) ? String(opts.watermark) : '';
     const ct = extractContacts(md);
     const today = nowStr().slice(0, 10);
 
@@ -1512,21 +1510,12 @@
       return `<div class="rs-sec">${titleHtml}${isChip ? `<div class="rs-chips">${inner}</div>` : inner}</div>`;
     }).join('');
 
-    const wmTag = wm ? `<span class="rs-foot-lic">${esc(wm)}</span>` : '';
-    const foot = `<div class="rs-foot"><span>Boss招聘小助手 · 定制优化</span><span>${today}${meta.company ? ' · 投递 ' + inlineMd(meta.company) : ''}</span>${wmTag}</div>`;
-    const wmHtml = wm
-      ? `<div class="rs-wm" aria-hidden="true"><span>${esc(wm)}</span><span>${esc(wm)}</span><span>${esc(wm)}</span></div>`
-      : '';
+    const foot = `<div class="rs-foot"><span>Boss招聘小助手 · 定制优化</span><span>${today}${meta.company ? ' · 投递 ' + inlineMd(meta.company) : ''}</span></div>`;
 
     const style = `
       .rs-wrap{ width:794px; background:#fff; color:#262626; box-sizing:border-box; position:relative; overflow:hidden;
                 font-family:'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Source Han Sans SC',sans-serif; }
       .rs-wrap *{ box-sizing:border-box; }
-      .rs-wm{ position:absolute; left:0; top:0; right:0; bottom:0; z-index:9; pointer-events:none;
-              display:flex; flex-direction:column; justify-content:space-evenly; align-items:center;
-              transform:rotate(-24deg); }
-      .rs-wm span{ font-size:24px; font-weight:700; color:rgba(100,116,139,.06); letter-spacing:4px; white-space:nowrap; }
-      .rs-foot-lic{ color:#b91c1c; opacity:.72; }
       .rs-sec{ margin-bottom:15px; }
       .rs-sec-t{ display:flex; align-items:center; margin-bottom:9px; }
       .rs-bar{ width:4px; height:15px; background:${accent}; border-radius:2px; margin-right:8px; }
@@ -1633,9 +1622,8 @@
       ? `<div class="rs-head">${inlineMd(head)}</div>`
       : '';
     /* 水印层插在 .rs-wrap 内部（absolute 定位以简历纸面为参照） */
-    const withWm = (cls, inner) => `<div class="rs-wrap ${cls}"><style>${style}</style>${wmHtml}${inner}</div>`;
     const body = theme === 'business'
-      ? withWm('rs-business', `
+      ? `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-side">
              <div class="rs-name">${inlineMd(name)}</div>
              <div class="rs-line"></div>
@@ -1644,18 +1632,18 @@
              <div class="rs-tag">Boss招聘小助手<br/>按岗位 JD 定制优化</div>
            </div>
            <div class="rs-main">${sectionsHtml}${foot}</div>
-         `)
+         `
       : theme === 'elegant'
-      ? withWm('rs-elegant', `
+      ? `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-top">
              <div class="rs-name">${inlineMd(name)}</div>
              ${headBlock}
              ${contactHtml}
            </div>
            ${sectionsHtml}${foot}
-         `)
+         `
       : theme === 'ocean'
-      ? withWm('rs-ocean', `
+      ? `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-top">
              <div>
                <div class="rs-name">${inlineMd(name)}</div>
@@ -1664,18 +1652,18 @@
              ${contactHtml}
            </div>
            ${sectionsHtml}${foot}
-         `)
+         `
       : theme === 'vitality'
-      ? withWm('rs-vitality', `
+      ? `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-top">
              <div class="rs-name">${inlineMd(name)}</div>
              ${headBlock}
            </div>
            ${contactHtml}
            ${sectionsHtml}${foot}
-         `)
+         `
       : theme === 'jade'
-      ? withWm('rs-jade', `
+      ? `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-top">
              <div class="rs-name">${inlineMd(name)}</div>
              ${headBlock}
@@ -1683,8 +1671,8 @@
            </div>
            <div class="rs-topline"></div>
            ${sectionsHtml}${foot}
-         `)
-      : withWm('rs-modern', `
+         `
+      : `<div class="rs-wrap ${cls}"><style>${style}</style>
            <div class="rs-top">
              <div>
                <div class="rs-name">${inlineMd(name)}</div>
@@ -1693,7 +1681,7 @@
              ${contactHtml}
            </div>
            ${sectionsHtml}${foot}
-         `);
+         `;
 
     return body;
   }
@@ -1741,7 +1729,7 @@
     if (!content) { toast('还没有优化简历，请先点击「开始优化」', 'err'); return Promise.reject(new Error('no-content')); }
     const theme = opts.theme || getResumeTheme();
     const scale = opts.scale || 2;
-    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const wm = '';
     const html = buildResumeHTML(content, theme, { watermark: wm });
 
     const host = document.createElement('div');
@@ -1822,7 +1810,7 @@
   // 生成可打印的 A4 HTML 文档（矢量中文、可搜索；窗口内不含任何内联脚本）
   function buildPrintDocument(theme, fileName) {
     const content = getStore(STORE_KEYS.optimized, '');
-    const wm = (typeof getLicenseWatermark === 'function') ? (getLicenseWatermark() || '') : '';
+    const wm = '';
     const inner = buildResumeHTML(content, theme, { watermark: wm });
     return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><title>${esc(fileName)}</title>
