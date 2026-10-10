@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手 · 授权版（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper-sell
-// @version      1.11.0
+// @version      1.11.2
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -989,6 +989,39 @@
     RAG_CACHE.set(key, val);
   }
 
+  // 后处理：检查 LLM 回复中是否提到了锚点列表之外的平台/公司，防止幻觉
+  function sanitizeReply(content, anchors, domain) {
+    if (!content) return { text: content, fixed: false };
+    
+    // 常见平台/公司关键词（用于检测幻觉）
+    const platformRe = /(淘宝|天猫|京东|拼多多|抖音|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|美团|饿了么|携程|飞猪|同程|马蜂窝|滴滴|货拉拉|贝壳|链家|安居客|钉钉|企业微信|飞书|微信)/gi;
+    
+    const found = [];
+    let m;
+    while ((m = platformRe.exec(content)) !== null) {
+      const w = m[0];
+      // 检查是否在 anchors 中（忽略大小写）
+      const inAnchors = anchors.some(a => a.toLowerCase() === w.toLowerCase());
+      if (!inAnchors) found.push({ word: w, index: m.index });
+    }
+    
+    if (!found.length) return { text: content, fixed: false };
+    
+    // 尝试替换：将幻觉平台替换为通用表述
+    let fixed = content;
+    let offset = 0;
+    for (const f of found) {
+      const idx = f.index + offset;
+      // 根据领域选择合适的替换词
+      const replacement = domain === 'domestic' ? '电商平台' : 
+                         domain === 'cross' ? '跨境电商平台' : '平台';
+      fixed = fixed.slice(0, idx) + replacement + fixed.slice(idx + f.word.length);
+      offset += replacement.length - f.word.length;
+    }
+    
+    return { text: fixed, fixed: true };
+  }
+
   // RAG 主函数：从所有知识源检索与 HR 问题最相关的 Top-K 片段（skipPrevRound：页面已抓到完整对话时跳过旧存储的一轮问答，避免重复）
   function ragRetrieve(hrQuestion, topK, skipPrevRound) {
     topK = topK || 5;
@@ -1026,13 +1059,22 @@
 
     if (!sources.length) return { context: '', sources: [] };
 
+    // 检测岗位领域（用于过滤不相关片段）
+    const domain = detectJobDomain(jd + '\n' + jdExplain);
+    const crossBorderRe = /亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|海外仓|头程|清关|关务|VAT|跨境支付|PayPal|PingPong|连连支付|万里汇|WorldFirst|Payoneer|Stripe|listing|FBA/i;
+    const domesticRe = /淘宝|天猫|京东|拼多多|抖音|抖店|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|淘特|京喜|千川|直通车|引力参谋|生意参谋/i;
+
     // 切块 + 评分
     const allChunks = [];
     sources.forEach((src) => {
       const chunks = chunkText(src.text, 300, 50);
       chunks.forEach((chunk, ci) => {
         const sc = scoreRelevance(query, chunk) * src.weight;
-        allChunks.push({ text: chunk, source: src.name, chunkIdx: ci, score: sc });
+        // 领域过滤：国内岗位过滤跨境片段，跨境岗位过滤国内片段
+        let filtered = false;
+        if (domain === 'domestic' && crossBorderRe.test(chunk)) filtered = true;
+        if (domain === 'cross' && domesticRe.test(chunk)) filtered = true;
+        if (!filtered) allChunks.push({ text: chunk, source: src.name, chunkIdx: ci, score: sc });
       });
     });
 
@@ -1104,16 +1146,16 @@
     // 构建带对话上下文与 RAG 知识的 system prompt
     const sys = [
       '你是一位帮助求职者与 HR 沟通的顾问。先阅读【最近对话记录】理解双方已沟通的内容与 HR 的关注点（HR 问过什么、候选人已答过什么），再针对 HR 的最新提问，结合【检索到的相关知识】，用候选人的第一人称写一条 Boss 直聘回复。',
+      '【最高优先级规则】' + domainRule,
       '严格遵守：',
-      '1. ' + domainRule,
-      '2. 真实经历边界：回复中声称拥有的平台、公司、项目、经历，必须能在【候选人真实经历关键词】或【检索到的相关知识】中找到出处；严禁把没有的经历写成自己的（如关键词里没有 Ozon/亚马逊 就不得声称做过）；可以如实说明没有某平台经验，并用最接近的真实经历迁移；',
-      '3. 只使用【检索到的相关知识】里真实存在的经历与数据，严禁编造；',
-      '4. 承接对话上下文：如果是追问，先呼应此前问答，不要重复已说过的内容，更不要答非所问；',
-      '5. 优先依据「岗位适配度分析」和「岗位需求理解」来回答，体现你对该岗位的深入理解；',
-      '6. 结合「优化后简历」中与 HR 问题最相关的具体经历/数据来佐证，不要泛泛自我介绍；',
-      '7. 经验空白如实填补：HR 问到简历未覆盖的经历时，不得编造；应如实说明（如「这块我接触不多」），再用最接近的真实经历或可迁移能力作答，或结合 JD 表达学习意愿；',
-      '8. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
-      '9. 只输出回复正文，不要引号、前缀和解释。'
+      '1. 真实经历边界：回复中声称拥有的平台、公司、项目、经历，必须能在【候选人真实经历关键词】或【检索到的相关知识】中找到出处；严禁把没有的经历写成自己的（如关键词里没有 Ozon/亚马逊 就不得声称做过）；可以如实说明没有某平台经验，并用最接近的真实经历迁移；',
+      '2. 只使用【检索到的相关知识】里真实存在的经历与数据，严禁编造；',
+      '3. 承接对话上下文：如果是追问，先呼应此前问答，不要重复已说过的内容，更不要答非所问；',
+      '4. 优先依据「岗位适配度分析」和「岗位需求理解」来回答，体现你对该岗位的深入理解；',
+      '5. 结合「优化后简历」中与 HR 问题最相关的具体经历/数据来佐证，不要泛泛自我介绍；',
+      '6. 经验空白如实填补：HR 问到简历未覆盖的经历时，不得编造；应如实说明（如「这块我接触不多」），再用最接近的真实经历或可迁移能力作答，或结合 JD 表达学习意愿；',
+      '7. 80~200 字，口语化但专业，分段最多 2 段，不用 emoji 和「您好」开头的模板腔；',
+      '8. 只输出回复正文，不要引号、前缀和解释。'
     ].join('\n');
 
     // 构建 user prompt：对话记录 + RAG 检索结果 + 真实经历锚点 + HR 最新提问
@@ -1135,7 +1177,8 @@
     ];
 
     const srcInfo = rag.sources.length ? '（RAG 来源：' + rag.sources.join(' / ') + '）' : '';
-    callLLM(messages, (content) => {
+    callLLM(messages, (raw) => {
+      const content = sanitizeReply(raw, anchors, domain);
       setStore(STORE_KEYS.hrReply, content);
       UI.renderHrReply(content, question);
       UI.showStatus('brh-chat', '✅ 回复已生成' + srcInfo + '，检查后可填入聊天框', 'ok');
@@ -1192,7 +1235,8 @@
       { role: 'user', content: userContent }
     ];
     UI.showStatus('brh-polish', '正在润色，请稍候…');
-    callLLM(messages, (content) => {
+    callLLM(messages, (raw) => {
+      const content = sanitizeReply(raw, anchors, domain);
       const out = $('#brh-polish-out');
       if (out) out.value = content;
       UI.showStatus('brh-polish', '✅ 润色完成，可继续编辑后填入聊天框', 'ok');
