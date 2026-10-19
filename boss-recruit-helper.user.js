@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Boss招聘小助手（JD捕获 + 简历AI优化 + 快捷投递）
 // @namespace    https://workbuddy.local/boss-recruit-helper
-// @version      1.11.2
+// @version      1.11.4
 // @description  在Boss直聘一键捕获岗位JD、按简历匹配筛选岗位、支持上传PDF/Word/TXT简历并AI优化、生成多套自定义打招呼话术、云端自动更新；优化后自动产出对应岗位话术并导出 PDF/图片/投递
 // @author       阿迪
 // @match        https://www.zhipin.com/*
@@ -60,7 +60,10 @@
   };
 
   // 版本与云端更新：把 DEFAULT_UPDATE_URL 换成你的托管地址（或在设置页填「云端更新地址」），油猴据此自动检查更新
-  const VERSION = '1.6.12';
+  // 版本号优先从脚本头 @version 自动读取（GM_info），避免与元数据不一致
+  const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+    ? GM_info.script.version
+    : '1.11.3';
   const DEFAULT_UPDATE_URL = 'https://gitee.com/zzc356/boss-recruit-helper/raw/master/boss-recruit-helper.user.js';
   // 优先使用用户在设置页填写的更新地址，否则用内置默认地址
   const getUpdateUrl = () => (getCfg().updateUrl || '').trim() || DEFAULT_UPDATE_URL;
@@ -164,6 +167,11 @@
     .brh-job-title { font-weight:600; font-size:13px; color:#303133; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .brh-job-meta { font-size:11.5px; color:#909399; margin:3px 0; }
     .brh-job-reason { font-size:11.5px; color:#606266; line-height:1.5; margin-top:2px; }
+    .brh-salary { color:#e8590c; font-weight:700; font-size:12.5px; margin-right:8px; }
+    .brh-active { display:inline-block; font-size:11px; padding:1px 7px; border-radius:9px; border:1px solid transparent; }
+    .brh-active.hot { color:#15803d; background:#dcfce7; border-color:#86efac; }
+    .brh-active.warm { color:#b45309; background:#fef3c7; border-color:#fcd34d; }
+    .brh-active.cold { color:#6b7280; background:#f3f4f6; border-color:#e5e7eb; }
     .brh-badge { display:inline-block; min-width:34px; text-align:center; border-radius:10px; padding:1px 6px; font-size:11.5px; font-weight:600; color:#fff; }
     .brh-badge.good { background:#16a34a; } .brh-badge.mid { background:#f59e0b; } .brh-badge.low { background:#dc2626; }
     .brh-match-hidden { display:none !important; }
@@ -254,20 +262,47 @@
       const titleEl = $('.job-name a', w) || $('a.job-name', w) || $('.job-title a', w) || $('h3 a', w) || $('a', w);
       const title = txt(titleEl).replace(/\s+/g, ' ').trim();
       if (!title || title.length < 2) continue;
-      const salary = txt($('.salary', w)) || txt($('.job-salary', w));
-      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w)) || txt($('.company-info a', w));
-      const scale = txt($('.company-scale', w)) || txt($('.scale', w)) || txt($('.company-size', w)) || txt($('.info-desc .scale', w)) || '';
+      const cardText = txt(w);
+
+      // 薪资：优先选择器，兜底用正则从卡片文本匹配（如 15-25K·13薪）
+      let salary = txt($('.salary', w)) || txt($('.job-salary', w)) || txt($('.salary-text', w)) || txt($('[class*="salary"]', w));
+      if (!salary) {
+        const sm = cardText.match(/\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*[Kk千万](?:\s*[·・]\s*\d+薪)?|\d+(?:\.\d+)?\s*[Kk千万](?:\s*[·・]\s*\d+薪)?/);
+        if (sm) salary = sm[0].replace(/\s+/g, '');
+      }
+
+      // 公司名称
+      const company = txt($('.company-text', w)) || txt($('h3.name a', w)) || txt($('.company-name', w))
+        || txt($('.company-info a', w)) || txt($('.company-info .name', w)) || txt($('[class*="company-name"]', w));
+
+      // 公司规模：优先选择器，兜底用正则匹配「500-999人 / 10000人以上 / 少于50人」
+      let scale = txt($('.company-scale', w)) || txt($('.scale', w)) || txt($('.company-size', w)) || txt($('.info-desc .scale', w)) || '';
+      if (!scale) {
+        const scm = cardText.match(/(?:少于\s*\d+\s*人|\d+\s*-\s*\d+\s*人|\d+\s*人以上)/);
+        if (scm) scale = scm[0].replace(/\s+/g, '');
+      }
+
+      // HR 活跃程度：优先选择器，兜底用正则从卡片文本匹配（刚刚活跃/今日活跃/3日内活跃/本周活跃…）
+      let hrActive = txt($('.boss-active', w)) || txt($('.job-card-footer .boss-active', w))
+        || txt($('.info-public .boss-active', w)) || txt($('[class*="boss-active"]', w))
+        || txt($('[class*="active-time"]', w)) || txt($('[class*="activeTime"]', w)) || '';
+      if (!hrActive) {
+        const am = cardText.match(/(刚刚活跃|今日活跃|本周活跃|本月活跃|半年前活跃|\d+\s*日内活跃|\d+\s*周内活跃|\d+\s*月内活跃|刚刚看过|今日看过)/);
+        if (am) hrActive = am[0].replace(/\s+/g, '');
+      }
+
       const area = txt($('.job-area', w)) || txt($('.job-area-wrapper', w)) || txt($('.city', w));
       const tags = $$('.tag-list .tag, .tag, .info-desc .tag', w).map(txt).filter(Boolean);
       const desc = txt($('.job-sec-text', w)) || txt($('.info-desc', w)) || txt($('.job-desc', w));
       const link = (titleEl && titleEl.href) ? titleEl : (w.querySelector('a') || null);
-      jobs.push({ el: w, title, salary, company, scale, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
+      jobs.push({ el: w, title, salary, company, scale, hrActive, area, tags, desc, href: link && link.href ? link.href : '', _link: link });
     }
     return jobs;
   }
 
   function buildJdFromCard(job) {
     const lines = [`【目标岗位】${job.title}${job.salary ? '　' + job.salary : ''}${job.company ? '　|　' + job.company : ''}${job.scale ? '　|　' + job.scale : ''}${job.area ? '　' + job.area : ''}`];
+    if (job.hrActive) lines.push(`\n## HR 活跃程度\n${job.hrActive}`);
     if (job.tags.length) lines.push(`\n## 任职要求 / 岗位标签\n${job.tags.join('、')}`);
     if (job.desc) lines.push(`\n## 职位描述\n${job.desc}`);
     return lines.join('\n');
@@ -298,9 +333,9 @@
   function matchJobsAI(resume, jobs, onResult) {
     const cfg = getCfg();
     if (!cfg.apiKey) { UI.showStatus('brh-match', '请先在「设置」填写 API Key，或改用「本地关键词」匹配', 'err'); UI.switchTab('settings'); return; }
-    const payload = jobs.map((j, i) => ({ idx: i, title: j.title, salary: j.salary, company: j.company, scale: j.scale, area: j.area, tags: j.tags, desc: (j.desc || '').slice(0, 200) }));
+    const payload = jobs.map((j, i) => ({ idx: i, title: j.title, salary: j.salary, company: j.company, scale: j.scale, hrActive: j.hrActive, area: j.area, tags: j.tags, desc: (j.desc || '').slice(0, 200) }));
     const messages = [
-      { role: 'system', content: '你是招聘匹配专家。给定候选人简历和一批岗位，逐岗评估匹配度。严格只输出一个 JSON 数组，每个元素形如 {"idx":序号,"score":0到100的整数,"fit":"合适|一般|不太合适","reason":"20字内中文理由，点出关键匹配或不匹配点"}。不要任何解释、不要 Markdown 代码块标记、不要序号。' },
+      { role: 'system', content: '你是招聘匹配专家。给定候选人简历和一批岗位（含薪资、公司规模、HR活跃程度），逐岗评估匹配度。评分以简历与岗位要求的契合度为主；若两个岗位条件相近，HR 活跃程度更高（如「刚刚活跃」「今日活跃」「3日内活跃」）的岗位可略加分（更可能及时回复）。严格只输出一个 JSON 数组，每个元素形如 {"idx":序号,"score":0到100的整数,"fit":"合适|一般|不太合适","reason":"20字内中文理由，点出关键匹配或不匹配点"}。不要任何解释、不要 Markdown 代码块标记、不要序号。' },
       { role: 'user', content: `【候选人简历】\n${resume}\n\n【待匹配岗位】\n${JSON.stringify(payload)}` }
     ];
     UI.showStatus('brh-match', 'AI 正在匹配本页岗位…（约 10~40 秒）');
@@ -370,6 +405,14 @@
     else onResult(matchJobsLocal(resume, jobs));
   }
 
+  // HR 活跃程度分级：hot=当日活跃 / warm=近期(3日内、本周) / cold=更早
+  function activeLevel(t) {
+    if (!t) return '';
+    if (/刚刚|今日|今天|分钟|小时/.test(t)) return 'hot';
+    if (/3日内|三日内|1日内|2日内|本周|1周内|一周内/.test(t)) return 'warm';
+    return 'cold';
+  }
+
   function renderMatchList(jobs, byIdx) {
     const list = $('#brh-match-list');
     if (!list) return;
@@ -377,6 +420,7 @@
     jobs.forEach((job, i) => {
       const r = byIdx[i] || { score: 0, fit: '不太合适', reason: '未评估' };
       const cls = r.fit === '合适' ? 'good' : r.fit === '一般' ? 'mid' : 'low';
+      const lv = activeLevel(job.hrActive);
       const item = document.createElement('div');
       item.className = 'brh-job';
       item.dataset.fit = r.fit;
@@ -385,7 +429,11 @@
           <span class="brh-job-title" title="${esc(job.title)}">${esc(job.title)}</span>
           <span class="brh-badge ${cls}">${r.score}</span>
         </div>
-        <div class="brh-job-meta">${esc(job.company || '—')}${job.scale ? '　·　' + esc(job.scale) : ''}${job.salary ? '　·　' + esc(job.salary) : ''}${job.area ? '　·　' + esc(job.area) : ''}</div>
+        <div class="brh-job-meta">${esc(job.company || '—')}${job.scale ? '　·　' + esc(job.scale) : ''}${job.area ? '　·　' + esc(job.area) : ''}</div>
+        <div class="brh-job-meta">
+          <span class="brh-salary">${esc(job.salary || '薪资面议')}</span>
+          ${job.hrActive ? `<span class="brh-active ${lv}" title="HR 活跃程度">🟢 ${esc(job.hrActive)}</span>` : ''}
+        </div>
         ${job.tags.length ? `<div class="brh-job-meta">${job.tags.slice(0, 6).map((t) => '<span class="brh-chip">' + esc(t) + '</span>').join('')}</div>` : ''}
         <div class="brh-job-reason">${esc(r.reason)}</div>
         <div style="text-align:right;margin-top:6px"><button class="brh-btn sm" data-apply="${i}">应用此岗位 →</button></div>
@@ -930,10 +978,55 @@
     return chunks;
   }
 
+  // 领域同义词/关联词表：扩展查询词，弥合“高并发”与“大流量”这类语义鸿沟
+  const DOMAIN_SYNONYMS = {
+    '高并发': ['大流量', '并发', '性能', '压测', 'qps', '吞吐', '峰值', '稳定性'],
+    '大流量': ['高并发', '流量', '峰值', '并发'],
+    '并发': ['高并发', '多线程', '吞吐'],
+    '转化率': ['转化', '成交', '成交率', '下单率'],
+    '转化': ['转化率', '成交', '成交率'],
+    'gmv': ['销售额', '成交额', '业绩', '流水'],
+    '销售额': ['业绩', '成交', 'gmv', '流水'],
+    '复购': ['留存', '会员', '私域', '复购率'],
+    '留存': ['复购', '会员', '活跃', '用户运营'],
+    '私域': ['会员', '社群', '复购', '留存', '用户运营'],
+    '直播': ['短视频', '内容运营', '达人', '主播', '种草'],
+    '投放': ['广告', '直通车', '千川', '获客', 'roi', '流量'],
+    '广告': ['投放', '直通车', '千川', '获客', 'roi'],
+    '选品': ['供应链', '采购', '库存', '商品', '品类'],
+    '供应链': ['采购', '库存', '履约', '仓储', '选品'],
+    '团队': ['管理', '带团队', 'leader', '负责人', '规模'],
+    '管理': ['团队', '带团队', '流程', '协作'],
+    '运营': ['操盘', '运营经理', '电商运营', '业务'],
+    '操盘': ['运营', '负责', '整体', '业务'],
+    '数据': ['数据分析', 'bi', '报表', '指标体系', '增长'],
+    '增长': ['用户增长', '数据', '拉新', '转化'],
+    '品牌': ['市场', '推广', '定位', '营销'],
+    '客服': ['售后', '服务', '满意度', '售前'],
+    '履约': ['物流', '仓储', '配送', '供应链'],
+    '跨境': ['海外', '出海', '亚马逊', '独立站', '外贸'],
+    '海外': ['跨境', '出海', '国际', '外贸']
+  };
+
+  // 查询词扩展：原始词 + 领域同义词（返回合并后的 token 集合）
+  function expandQueryTokens(query) {
+    const set = tokenizeUnique(query);
+    const text = String(query || '').toLowerCase();
+    Object.keys(DOMAIN_SYNONYMS).forEach((key) => {
+      if (text.includes(key.toLowerCase())) {
+        DOMAIN_SYNONYMS[key].forEach((syn) => {
+          tokenizeUnique(syn).forEach((t) => set.add(t));
+        });
+      }
+    });
+    return set;
+  }
+
   // 计算查询与文本的相关性分数（TF-IDF 简化 + 关键词覆盖 + 语义近似）
   function scoreRelevance(query, text) {
     if (!query || !text) return 0;
     const qTokens = tokenizeUnique(query);
+    const eTokens = expandQueryTokens(query); // 原始 + 同义词扩展
     const tTokens = tokenizeUnique(text);
     let score = 0;
     let matched = 0;
@@ -945,6 +1038,11 @@
           if (tt.includes(qt) || qt.includes(tt)) { score += 1; break; }
         }
       }
+    });
+    // 同义词扩展命中（较低权重，用于弥合语义鸿沟）
+    eTokens.forEach((et) => {
+      if (qTokens.has(et)) return; // 已计入
+      if (tTokens.has(et)) { score += 1; matched += 0.5; }
     });
     // 覆盖度加权（查询词被命中的比例越高越好）
     const coverage = qTokens.size ? matched / qTokens.size : 0;
@@ -986,9 +1084,9 @@
     RAG_CACHE.set(key, val);
   }
 
-  // 后处理：检查 LLM 回复中是否提到了锚点列表之外的平台/公司，防止幻觉
+  // 后处理：检查 LLM 回复中是否提到了锚点列表之外的平台/公司，防止幻觉（返回修正后的文本）
   function sanitizeReply(content, anchors, domain) {
-    if (!content) return { text: content, fixed: false };
+    if (!content) return content;
     
     // 常见平台/公司关键词（用于检测幻觉）
     const platformRe = /(淘宝|天猫|京东|拼多多|抖音|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|美团|饿了么|携程|飞猪|同程|马蜂窝|滴滴|货拉拉|贝壳|链家|安居客|钉钉|企业微信|飞书|微信)/gi;
@@ -1002,7 +1100,7 @@
       if (!inAnchors) found.push({ word: w, index: m.index });
     }
     
-    if (!found.length) return { text: content, fixed: false };
+    if (!found.length) return content;
     
     // 尝试替换：将幻觉平台替换为通用表述
     let fixed = content;
@@ -1016,16 +1114,91 @@
       offset += replacement.length - f.word.length;
     }
     
-    return { text: fixed, fixed: true };
+    return fixed;
   }
 
   // RAG 主函数：从所有知识源检索与 HR 问题最相关的 Top-K 片段（skipPrevRound：页面已抓到完整对话时跳过旧存储的一轮问答，避免重复）
+  // 收集知识源（JD / 简历 / 岗位理解 / 适配度 / 简历库 / 上一轮对话），同时返回岗位领域
+  function collectRagSources(skipPrevRound) {
+    const sources = [];
+    const jd = getStore(STORE_KEYS.jd, '');
+    const resume = getStore(STORE_KEYS.resume, '');
+    const jdExplain = getStore(STORE_KEYS.jdExplain, '');
+    const jdFit = getStore(STORE_KEYS.jdFit, '');
+    const optimized = getStore(STORE_KEYS.optimized, '');
+    const prevQ = getStore(STORE_KEYS.hrQuestion, '');
+    const prevA = getStore(STORE_KEYS.hrReply, '');
+    const domain = detectJobDomain(jd + '\n' + jdExplain);
+
+    if (jd) sources.push({ name: '岗位 JD', text: jd, weight: 1.5 });
+    if (optimized) sources.push({ name: '优化后简历', text: optimized, weight: 1.8 });
+    else if (resume) sources.push({ name: '原始简历', text: resume, weight: 1.5 });
+    // 简历库：按当前岗位领域优先匹配分类（如国内岗位优先取"电商/运营"类），未匹配则全部纳入
+    const lib = getStore(STORE_KEYS.resumeLibrary, null);
+    if (lib && lib.categories && lib.categories.length) {
+      const relRe = domain === 'cross'
+        ? /跨境|海外|国际|外贸|amazon|shopee|亚马逊|运营|销售|电商/i
+        : domain === 'domestic' ? /国内|电商|淘宝|天猫|京东|拼多多|运营|销售/i : null;
+      let chosen = lib.categories;
+      if (relRe) {
+        const hit = lib.categories.filter((c) => relRe.test(c.category || ''));
+        if (hit.length) chosen = hit;
+      }
+      let added = 0;
+      for (const cat of chosen) {
+        if (added >= 8) break;
+        for (const it of (cat.items || [])) {
+          if (added >= 8) break;
+          if (it && it.text) {
+            sources.push({ name: '简历库·' + cat.category + '·' + (it.title || it.name || ''), text: it.text, weight: 1.6 });
+            added++;
+          }
+        }
+      }
+    }
+    if (jdExplain) sources.push({ name: '岗位需求理解', text: jdExplain, weight: 1.3 });
+    if (jdFit) sources.push({ name: '岗位适配度分析', text: jdFit, weight: 1.2 });
+    if (prevQ && prevA && !skipPrevRound) sources.push({ name: '上一轮 HR 对话', text: 'HR问：' + prevQ + '\n候选人答：' + prevA, weight: 1.0 });
+
+    return { sources, domain };
+  }
+
+  const CROSS_BORDER_RE = /亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|海外仓|头程|清关|关务|VAT|跨境支付|PayPal|PingPong|连连支付|万里汇|WorldFirst|Payoneer|Stripe|listing|FBA/i;
+  const DOMESTIC_RE = /淘宝|天猫|京东|拼多多|抖音|抖店|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|淘特|京喜|千川|直通车|引力参谋|生意参谋/i;
+
+  // 切块 + 关键词评分（含同义词扩展），并按岗位领域过滤不相关片段
+  function scoreChunks(query, sources, domain) {
+    const allChunks = [];
+    sources.forEach((src) => {
+      chunkText(src.text, 300, 50).forEach((chunk, ci) => {
+        const sc = scoreRelevance(query, chunk) * src.weight;
+        let filtered = false;
+        if (domain === 'domestic' && CROSS_BORDER_RE.test(chunk)) filtered = true;
+        if (domain === 'cross' && DOMESTIC_RE.test(chunk)) filtered = true;
+        if (!filtered) allChunks.push({ text: chunk, source: src.name, chunkIdx: ci, score: sc });
+      });
+    });
+    allChunks.sort((a, b) => b.score - a.score);
+    return allChunks;
+  }
+
+  // 由排序后的 chunks 构建上下文（带来源标注）
+  function buildRagContext(sortedChunks, topK) {
+    let context = '';
+    const usedSources = [];
+    sortedChunks.slice(0, topK).forEach((c) => {
+      if (c.score < 2) return;
+      context += '【' + c.source + '】' + c.text + '\n\n';
+      if (!usedSources.includes(c.source)) usedSources.push(c.source);
+    });
+    return { context: context.trim(), sources: usedSources };
+  }
+
   function ragRetrieve(hrQuestion, topK, skipPrevRound) {
     topK = topK || 5;
     const query = cleanText(hrQuestion || '');
     if (!query) return { context: '', sources: [] };
 
-    // 缓存 key：query + 知识库长度 + skipPrevRound（避免相同输入重复计算）
     const cacheKey = [query,
       getStore(STORE_KEYS.jd, '').length,
       getStore(STORE_KEYS.resume, '').length,
@@ -1037,63 +1210,94 @@
     const cached = ragCacheGet(cacheKey);
     if (cached) return cached;
 
-    // 收集所有知识源
-    const sources = [];
-    const jd = getStore(STORE_KEYS.jd, '');
-    const resume = getStore(STORE_KEYS.resume, '');
-    const jdExplain = getStore(STORE_KEYS.jdExplain, '');
-    const jdFit = getStore(STORE_KEYS.jdFit, '');
-    const optimized = getStore(STORE_KEYS.optimized, '');
-    const prevQ = getStore(STORE_KEYS.hrQuestion, '');
-    const prevA = getStore(STORE_KEYS.hrReply, '');
-
-    if (jd) sources.push({ name: '岗位 JD', text: jd, weight: 1.5 });
-    if (optimized) sources.push({ name: '优化后简历', text: optimized, weight: 1.8 });
-    else if (resume) sources.push({ name: '原始简历', text: resume, weight: 1.5 });
-    if (jdExplain) sources.push({ name: '岗位需求理解', text: jdExplain, weight: 1.3 });
-    if (jdFit) sources.push({ name: '岗位适配度分析', text: jdFit, weight: 1.2 });
-    if (prevQ && prevA && !skipPrevRound) sources.push({ name: '上一轮 HR 对话', text: 'HR问：' + prevQ + '\n候选人答：' + prevA, weight: 1.0 });
-
+    const { sources, domain } = collectRagSources(skipPrevRound);
     if (!sources.length) return { context: '', sources: [] };
 
-    // 检测岗位领域（用于过滤不相关片段）
-    const domain = detectJobDomain(jd + '\n' + jdExplain);
-    const crossBorderRe = /亚马逊|Amazon|Shopee|Lazada|速卖通|AliExpress|TikTok Shop|Temu|SHEIN|Wish|eBay|Etsy|Wayfair|Coupang|Ozon|Mercado Libre|独立站|海外仓|头程|清关|关务|VAT|跨境支付|PayPal|PingPong|连连支付|万里汇|WorldFirst|Payoneer|Stripe|listing|FBA/i;
-    const domesticRe = /淘宝|天猫|京东|拼多多|抖音|抖店|快手|小红书|得物|唯品会|苏宁|闲鱼|1688|淘特|京喜|千川|直通车|引力参谋|生意参谋/i;
-
-    // 切块 + 评分
-    const allChunks = [];
-    sources.forEach((src) => {
-      const chunks = chunkText(src.text, 300, 50);
-      chunks.forEach((chunk, ci) => {
-        const sc = scoreRelevance(query, chunk) * src.weight;
-        // 领域过滤：国内岗位过滤跨境片段，跨境岗位过滤国内片段
-        let filtered = false;
-        if (domain === 'domestic' && crossBorderRe.test(chunk)) filtered = true;
-        if (domain === 'cross' && domesticRe.test(chunk)) filtered = true;
-        if (!filtered) allChunks.push({ text: chunk, source: src.name, chunkIdx: ci, score: sc });
-      });
-    });
-
-    // 按分数排序取 Top-K，去重（相邻同来源片段合并）
-    allChunks.sort((a, b) => b.score - a.score);
-    const top = allChunks.slice(0, topK);
-
-    // 构建上下文（带来源标注）
-    let context = '';
-    const usedSources = [];
-    top.forEach((c) => {
-      if (c.score < 2) return; // 过滤低相关
-      context += '【' + c.source + '】' + c.text + '\n\n';
-      if (!usedSources.includes(c.source)) usedSources.push(c.source);
-    });
-
-    const result = { context: context.trim(), sources: usedSources, chunks: top };
+    const sorted = scoreChunks(query, sources, domain);
+    const built = buildRagContext(sorted, topK);
+    const result = { context: built.context, sources: built.sources, chunks: sorted.slice(0, topK) };
     ragCacheSet(cacheKey, result);
     return result;
   }
 
-  function generateHrReply(opts = {}) {
+  /* ---- 语义检索（embedding）：可选增强，需设置页配置 ---- */
+  function getEmbeddingConfig() {
+    const cfg = getCfg();
+    return {
+      enabled: !!cfg.useSemanticSearch && !!cfg.apiKey && !!cfg.embeddingModel,
+      url: (cfg.embeddingUrl || cfg.baseUrl || DEFAULT_CFG.baseUrl).replace(/\/+$/, '') + '/embeddings',
+      key: cfg.apiKey,
+      model: cfg.embeddingModel
+    };
+  }
+
+  // 批量向量化；失败返回 null（调用方回退到关键词检索）
+  function embedTexts(texts) {
+    const ec = getEmbeddingConfig();
+    if (!ec.enabled || !texts.length) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'POST', url: ec.url, timeout: 40000,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + ec.key },
+        data: JSON.stringify({ model: ec.model, input: texts }),
+        onload(res) {
+          try {
+            const data = JSON.parse(res.responseText);
+            const arr = (data.data || []).map((d) => d.embedding);
+            resolve(arr.length ? arr : null);
+          } catch (e) { resolve(null); }
+        },
+        onerror() { resolve(null); },
+        ontimeout() { resolve(null); }
+      });
+    });
+  }
+
+  function cosineSim(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+  }
+
+  // 异步检索：关键词分 + embedding 余弦相似度加权混合重排
+  async function ragRetrieveAsync(hrQuestion, topK, skipPrevRound) {
+    topK = topK || 5;
+    const query = cleanText(hrQuestion || '');
+    if (!query) return { context: '', sources: [] };
+
+    const { sources, domain } = collectRagSources(skipPrevRound);
+    if (!sources.length) return { context: '', sources: [] };
+    const sorted = scoreChunks(query, sources, domain);
+    if (!sorted.length) return { context: '', sources: [] };
+
+    const ec = getEmbeddingConfig();
+    if (!ec.enabled) {
+      const built = buildRagContext(sorted, topK);
+      return { context: built.context, sources: built.sources, chunks: sorted.slice(0, topK) };
+    }
+
+    // 对候选片段做向量化（取前 40 个候选，控制调用量）
+    const candidates = sorted.slice(0, 40);
+    const vectors = await embedTexts([query].concat(candidates.map((c) => c.text)));
+    if (!vectors || vectors.length !== candidates.length + 1) {
+      const built = buildRagContext(sorted, topK);
+      return { context: built.context, sources: built.sources, chunks: sorted.slice(0, topK) };
+    }
+    const qVec = vectors[0];
+    const semantic = candidates.map((c, i) => ({ c, sim: cosineSim(qVec, vectors[i + 1]) }));
+    // 混合：关键词分归一化 * 0.4 + 语义相似度 * 0.6
+    const maxKw = Math.max.apply(null, candidates.map((c) => c.score)) || 1;
+    semantic.forEach((s) => { s.mixed = (s.c.score / maxKw) * 0.4 + s.sim * 0.6; });
+    semantic.sort((a, b) => b.mixed - a.mixed);
+    const reRanked = semantic.map((s) => s.c);
+    // 领域过滤（与关键词版一致）
+    const kept = reRanked.filter((c) => !(domain === 'domestic' && CROSS_BORDER_RE.test(c.text)) && !(domain === 'cross' && DOMESTIC_RE.test(c.text)));
+    const built = buildRagContext(kept.length ? kept : reRanked, topK);
+    return { context: built.context, sources: built.sources, chunks: (kept.length ? kept : reRanked).slice(0, topK) };
+  }
+
+  async function generateHrReply(opts = {}) {
     const optimized = getStore(STORE_KEYS.optimized, '');
     if (!optimized) { toast('还没有优化简历：请先在「✨ 优化」页完成一次优化', 'err'); UI.switchTab('optimize'); return; }
     const jd = getStore(STORE_KEYS.jd, '');
@@ -1124,7 +1328,7 @@
 
     // === RAG 增强：用 HR 最近几条消息做查询，从 JD/简历/岗位理解/适配度 检索最相关的片段 ===
     const hrRecent = conv.msgs.filter((m) => !m.mine).slice(-3).map((m) => m.text).join(' ');
-    const rag = ragRetrieve(hrRecent || question, 5, conv.msgs.length >= 2);
+    const rag = await ragRetrieveAsync(hrRecent || question, 8, conv.msgs.length >= 2);
 
     // 岗位领域约束：国内电商岗位严禁说成跨境方向，跨境岗位才说跨境，防止串领域
     const domain = detectJobDomain(conv.msgs.filter((m) => !m.mine).map((m) => m.text).join('\n'));
@@ -1161,6 +1365,13 @@
     }
     if (rag.context) {
       userContent += '【检索到的相关知识（RAG）】\n' + rag.context + '\n\n';
+      // 检索片段过短时补充完整简历，避免 LLM 缺乏事实依据而编造
+      if (rag.context.length < 400 && optimized) {
+        userContent += '【优化后简历（全文补充）】\n' + optimized.slice(0, 6000) + '\n\n';
+      }
+    } else {
+      userContent += '【目标岗位 JD】\n' + jd.slice(0, 2000) + '\n\n';
+      userContent += '【优化后简历】\n' + optimized.slice(0, 6000) + '\n\n';
     }
     if (anchors.length) {
       userContent += '【候选人真实经历关键词（只能使用这些，不得出现其他平台/经历）】\n' + anchors.join('、') + '\n\n';
@@ -1183,7 +1394,7 @@
   }
 
   /* 润色用户自己写的话术：保留原意，结合对话 + 知识库 + 简历真实经历优化表达 */
-  function polishUserMessage() {
+  async function polishUserMessage() {
     const draft = String($('#brh-polish-in') ? $('#brh-polish-in').value : '').trim();
     if (!draft) { toast('请先输入或粘贴你要润色的话术', 'err'); return; }
     const optimized = getStore(STORE_KEYS.optimized, '');
@@ -1191,7 +1402,7 @@
     const jd = getStore(STORE_KEYS.jd, '');
     const conv = extractConversation();
     const hrRecent = conv.msgs.filter((m) => !m.mine).slice(-3).map((m) => m.text).join(' ');
-    const rag = ragRetrieve(draft + ' ' + hrRecent, 5, conv.msgs.length >= 2);
+    const rag = await ragRetrieveAsync(draft + ' ' + hrRecent, 8, conv.msgs.length >= 2);
     const anchors = extractResumeAnchors();
     const domain = detectJobDomain(conv.msgs.filter((m) => !m.mine).map((m) => m.text).join('\n'));
     const domainRule = domain === 'domestic'
@@ -1217,6 +1428,9 @@
     }
     if (rag.context) {
       userContent += '【检索到的相关知识（RAG）】\n' + rag.context + '\n\n';
+      if (rag.context.length < 400 && optimized) {
+        userContent += '【优化后简历（全文补充）】\n' + optimized.slice(0, 6000) + '\n\n';
+      }
     } else {
       userContent += '【目标岗位 JD】\n' + jd.slice(0, 2000) + '\n\n';
       userContent += '【优化后简历】\n' + optimized.slice(0, 6000) + '\n\n';
@@ -2472,6 +2686,15 @@
           <div class="brh-tip" style="margin-top:3px">把脚本托管到 GitHub 后填这里，「检查更新」即可发现新版本；留空则使用内置默认地址。</div>
         </div>
         <div class="brh-row">
+          <label class="brh-label">语义检索（Embedding）</label>
+          <label style="font-size:12px;color:#606266;display:block;margin-bottom:5px">
+            <input type="checkbox" id="brh-cfg-semantic" ${cfg.useSemanticSearch ? 'checked' : ''}> 启用向量语义检索（更懂“高并发”和“大流量”这类同义表述）
+          </label>
+          <input class="brh-input" id="brh-cfg-embedmodel" value="${esc(cfg.embeddingModel || '')}" placeholder="Embedding 模型，如 text-embedding-3-small / BAAI/bge-small-zh-v1.5">
+          <input class="brh-input" id="brh-cfg-embedurl" value="${esc(cfg.embeddingUrl || '')}" placeholder="Embedding 接口地址（留空则用上面的 Base URL）" style="margin-top:5px">
+          <div class="brh-tip" style="margin-top:3px">开启后，生成回复时会额外调用一次 Embedding 接口做向量排序，召回更准；关闭时仅用关键词检索，零额外成本。</div>
+        </div>
+        <div class="brh-row">
           <button class="brh-btn green" id="brh-cfg-save">保存设置</button>
           <button class="brh-btn ghost" id="brh-cfg-test">测试连通</button>
         </div>
@@ -2491,7 +2714,10 @@
           apiKey: $('#brh-cfg-key').value.trim(),
           model: $('#brh-cfg-model').value.trim() || DEFAULT_CFG.model,
           resumeTheme: th,
-          updateUrl: $('#brh-cfg-updateurl') ? $('#brh-cfg-updateurl').value.trim() : ''
+          updateUrl: $('#brh-cfg-updateurl') ? $('#brh-cfg-updateurl').value.trim() : '',
+          useSemanticSearch: $('#brh-cfg-semantic') ? !!$('#brh-cfg-semantic').checked : false,
+          embeddingModel: $('#brh-cfg-embedmodel') ? $('#brh-cfg-embedmodel').value.trim() : '',
+          embeddingUrl: $('#brh-cfg-embedurl') ? $('#brh-cfg-embedurl').value.trim() : ''
         });
         setStore(STORE_KEYS.license, $('#brh-cfg-license').value.trim());
         this.showStatus('brh-cfg', '✅ 已保存', 'ok');
@@ -2503,7 +2729,10 @@
           apiKey: $('#brh-cfg-key').value.trim(),
           model: $('#brh-cfg-model').value.trim() || DEFAULT_CFG.model,
           resumeTheme: th2,
-          updateUrl: $('#brh-cfg-updateurl') ? $('#brh-cfg-updateurl').value.trim() : ''
+          updateUrl: $('#brh-cfg-updateurl') ? $('#brh-cfg-updateurl').value.trim() : '',
+          useSemanticSearch: $('#brh-cfg-semantic') ? !!$('#brh-cfg-semantic').checked : false,
+          embeddingModel: $('#brh-cfg-embedmodel') ? $('#brh-cfg-embedmodel').value.trim() : '',
+          embeddingUrl: $('#brh-cfg-embedurl') ? $('#brh-cfg-embedurl').value.trim() : ''
         });
         setStore(STORE_KEYS.license, $('#brh-cfg-license').value.trim());
         this.showStatus('brh-cfg', '测试中…');
@@ -2623,7 +2852,7 @@
     });
   }
 
-  /* 在线更新：下载最新脚本 → 打开更新引导页（复制内容 + 油猴操作指引） */
+  /* 在线更新：下载最新脚本 → 自动下载 .user.js 文件 → 提示导入油猴 */
   function downloadAndUpdate(version) {
     UI.showStatus('brh-update', '正在下载最新版本…');
     GM_xmlhttpRequest({
@@ -2634,119 +2863,21 @@
           UI.showStatus('brh-update', '下载失败：内容异常', 'err');
           return;
         }
-        setStore('brh_update_content', content);
-        setStore('brh_update_version', version);
-        openUpdatePage(content, version);
-        UI.showStatus('brh-update', '✅ 已下载最新版本，请按页面指引在油猴中更新', 'ok');
+        // 自动触发浏览器下载 .user.js 文件（Blob 下载无需扩展权限）
+        const blob = new Blob([content], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'boss-recruit-helper' + (location.pathname.includes('sell') ? '-sell' : '') + '.user.js';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 3000);
+        UI.showStatus('brh-update', '✅ 已下载最新版 v' + version + '，请在油猴管理面板导入该文件完成更新', 'ok');
+        toast('已下载最新版，请导入油猴完成更新', 'ok');
       },
-      onerror() { UI.showStatus('brh-update', '下载失败', 'err'); },
-      ontimeout() { UI.showStatus('brh-update', '下载超时', 'err'); }
+      onerror() { UI.showStatus('brh-update', '下载失败，请稍后重试', 'err'); },
+      ontimeout() { UI.showStatus('brh-update', '下载超时，请检查网络后重试', 'err'); }
     });
-  }
-
-  /* 打开更新引导页：显示脚本内容 + 复制按钮 + 油猴操作指引 */
-  function openUpdatePage(content, version) {
-    const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Boss招聘小助手 v${version} 更新</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
-  .card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-  h1 { color: #1a1a1a; font-size: 24px; margin: 0 0 16px; }
-  .step { display: flex; align-items: flex-start; margin: 12px 0; padding: 12px; background: #f8f9fa; border-radius: 8px; }
-  .step-num { width: 28px; height: 28px; background: #0ea5e9; color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 12px; flex-shrink: 0; }
-  .step-content { flex: 1; }
-  .step-title { font-weight: 600; margin-bottom: 4px; }
-  .step-desc { color: #666; font-size: 14px; line-height: 1.6; }
-  .btn { display: inline-block; padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 600; margin: 8px 8px 0 0; }
-  .btn-primary { background: #0ea5e9; color: white; }
-  .btn-secondary { background: #e5e7eb; color: #374151; }
-  .btn:hover { opacity: 0.9; }
-  .code-preview { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 12px; max-height: 200px; overflow: auto; margin-top: 12px; white-space: pre-wrap; word-break: break-all; }
-  .success { color: #10b981; font-weight: 600; }
-  .version-info { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
-  .version-info strong { color: #1e40af; }
-</style>
-</head><body>
-<div class="card">
-  <h1>🆕 Boss招聘小助手 v${version} 更新</h1>
-  <div class="version-info">
-    当前版本：<strong>v${VERSION}</strong> → 新版本：<strong>v${version}</strong>
-  </div>
-  
-  <div class="step">
-    <div class="step-num">1</div>
-    <div class="step-content">
-      <div class="step-title">复制最新脚本内容</div>
-      <div class="step-desc">点击下方按钮复制完整脚本内容到剪贴板</div>
-      <button class="btn btn-primary" onclick="copyScript()">📋 复制脚本内容</button>
-      <span id="copy-status"></span>
-    </div>
-  </div>
-  
-  <div class="step">
-    <div class="step-num">2</div>
-    <div class="step-content">
-      <div class="step-title">打开油猴管理面板</div>
-      <div class="step-desc">点击下方按钮打开浏览器扩展管理页面，找到油猴（Tampermonkey）</div>
-      <button class="btn btn-secondary" onclick="openExtensions()">🔧 打开扩展管理页面</button>
-    </div>
-  </div>
-  
-  <div class="step">
-    <div class="step-num">3</div>
-    <div class="step-content">
-      <div class="step-title">在油猴中更新脚本</div>
-      <div class="step-desc">
-        在油猴管理面板中找到「Boss招聘小助手」，点击「编辑」，<br>
-        全选（Ctrl+A）→ 粘贴（Ctrl+V）→ 保存（Ctrl+S）
-      </div>
-    </div>
-  </div>
-  
-  <div class="step">
-    <div class="step-num">4</div>
-    <div class="step-content">
-      <div class="step-title">完成更新</div>
-      <div class="step-desc">刷新 Boss 直聘页面即可使用新版本</div>
-    </div>
-  </div>
-  
-  <div class="code-preview" id="script-preview">${content.slice(0, 300).replace(/</g, '&lt;')}...</div>
-</div>
-
-<script>
-  const scriptContent = ${JSON.stringify(content)};
-  
-  function copyScript() {
-    navigator.clipboard.writeText(scriptContent).then(() => {
-      document.getElementById('copy-status').innerHTML = '<span class="success">✅ 已复制到剪贴板</span>';
-    }).catch(() => {
-      const textarea = document.createElement('textarea');
-      textarea.value = scriptContent;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      document.getElementById('copy-status').innerHTML = '<span class="success">✅ 已复制到剪贴板</span>';
-    });
-  }
-  
-  function openExtensions() {
-    // 尝试打开浏览器扩展管理页面
-    if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.openOptionsPage) {
-      // Firefox
-      window.open('about:addons', '_blank');
-    } else {
-      // Chrome / Edge
-      window.open('chrome://extensions', '_blank');
-    }
-  }
-<\/script>
-</body></html>`;
-    
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    GM_openInTab(url, { active: true });
   }
 
   function verifyLicense(code) {
