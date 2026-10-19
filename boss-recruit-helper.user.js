@@ -1199,12 +1199,15 @@
     const query = cleanText(hrQuestion || '');
     if (!query) return { context: '', sources: [] };
 
+    const lib = getStore(STORE_KEYS.resumeLibrary, null);
     const cacheKey = [query,
+      topK,
       getStore(STORE_KEYS.jd, '').length,
       getStore(STORE_KEYS.resume, '').length,
       getStore(STORE_KEYS.optimized, '').length,
       getStore(STORE_KEYS.jdExplain, '').length,
       getStore(STORE_KEYS.jdFit, '').length,
+      lib ? JSON.stringify(lib).length : 0,
       skipPrevRound
     ].join('|');
     const cached = ragCacheGet(cacheKey);
